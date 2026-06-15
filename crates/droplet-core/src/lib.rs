@@ -3,6 +3,7 @@
 //! No `pyo3` here (invariant #8): the Python bridge lives only in `droplet-py`.
 
 pub mod registry;
+pub mod sandbox;
 pub mod session;
 pub mod source;
 
@@ -19,11 +20,13 @@ pub enum DropletError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    #[error("monty error")]
+    Monty(#[from] monty::MontyException),
 }
 
 // Future #[from] variants fold in as engines arrive (invariant #10):
 //   DuckDb(#[from] duckdb::Error)            // M1 (local analyze engine)
-//   Monty(#[from] monty::MontyException)     // Chunk H (this milestone) — verify the type name
 //   Surreal(#[from] surrealdb::Error)        // M9 (read-only field search)
 //   S3 / Redis / DynamoDB / postcard / zstd / tokio::task::JoinError  // M5/M7/M8
 

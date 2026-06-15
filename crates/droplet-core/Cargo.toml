@@ -10,3 +10,4 @@ thiserror.workspace   = true
 serde.workspace       = true
 async-trait.workspace = true
 tokio.workspace       = true
+monty.workspace       = true
