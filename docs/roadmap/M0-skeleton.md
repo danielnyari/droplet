@@ -29,6 +29,13 @@ The spec is at [`PRODUCT.md`](../../PRODUCT.md) (repo root). When a task says "�
 
 > **What M0 deliberately does NOT touch** (so you don't over-build): no DuckDB (that's M1), no `load` boundary / catalog (M2), no Monty *driver* loop with type-check (M3), no `#[droplet_tool]` macro (M4), no real S3/Redis/DynamoDB clients or the **other three store traits** (`ArtifactStore` → M5, `CoordinationStore` → M7, `SnapshotStore` → M8 — M0 ships *only* the `Source` seam, with a local dev impl), no read-only SurrealDB field search (M9), no snapshot serialization (M8), no Pydantic schema codegen (M4). **M0 is the bones: the workspace, the error type, the registry, the `Session`, the `Source` connector seam, the wheel, and a live Monty host-function seam.**
 
+> ✅ **Verified by building M0 (2026-06-15) — corrections to the snippets below.** The build disproved a few guesses in the original draft. Read these first; the chunks below are updated to match the committed code:
+> - **pyo3 is `0.28`, NOT `0.29`.** monty `v0.0.18` transitively pulls pyo3 `0.28.x` (via its `jiter` JSON dep, which resolves to `0.28.3`), and `pyo3-ffi` has `links = "python"`, so the **whole workspace must share ONE pyo3 version**. Using `0.29` in `droplet-py` causes `failed to select a version for pyo3-ffi ... conflicts with ... links python`.
+> - **Invariant #8 has a caveat at this monty tag.** Because monty `v0.0.18` pulls pyo3 in via `jiter`, `droplet-core` is **not literally pyo3-free** — pyo3 appears *transitively* in its dependency tree. The **spirit** still holds: `droplet-core` contains no Python-binding code and never `use`s pyo3. The hard "no pyo3 in core" line becomes literally true only when monty drops the `jiter`→pyo3 transitive dep.
+> - **Drop the pyo3 `extension-module` feature.** It is deprecated (it disables libpython linking and breaks `cargo build`/`cargo test --workspace`). With it removed, plain cargo links libpython, and `maturin develop` (≥ 1.9.4) builds the extension module itself.
+> - **`pyproject.toml` needs `version` and a `python-source` package** (maturin 1.14) — see Chunk G.
+> - **The monty Chunk H snippets are now real** (verified against `v0.0.18` source), not guesses.
+
 > **Sibling files this one links to** (names per the [roadmap structure](./README.md)): [`M1-analyze-engine.md`](./M1-analyze-engine.md), and later [`M2-load-boundary.md`](./M2-load-boundary.md), [`M3-monty-driver.md`](./M3-monty-driver.md), [`M4-droplet-tool-macro.md`](./M4-droplet-tool-macro.md), [`M5-artifact-cache.md`](./M5-artifact-cache.md), [`M7-coordination.md`](./M7-coordination.md), [`M8-snapshot-resume.md`](./M8-snapshot-resume.md). If a file doesn't exist yet, the link is a forward reference — you'll create it when you reach that milestone.
 
 ---
@@ -48,7 +55,7 @@ You already did the warm-up and the first M0 steps, so a partial workspace is on
   components = ["rustfmt", "clippy"]
   ```
   - 🆕 Concept: `rust-toolchain.toml` pins one compiler version *per repo*; `rustup` auto-installs it the first time you run any cargo command here, making builds reproducible across machines and time. (Rust Book: Appendix E — Editions covers editions; toolchain pinning is a Cargo/rustup feature.)
-  - Note: any stable `≥ 1.85.0` supports edition 2024; `1.96.0` is current (June 2026). Pinning an exact version is more deterministic than `"stable"`. (The whole later stack clears it: PyO3 0.29's MSRV is well under this, an *edition-2024* consumer crate needs ≥ 1.85, `maturin 1.14` wants ≥ 1.89, and `redis 1.2` wants ≥ 1.88 — `1.96.0` clears all of them.)
+  - Note: any stable `≥ 1.85.0` supports edition 2024; `1.96.0` is current (June 2026). Pinning an exact version is more deterministic than `"stable"`. (The whole later stack clears it: PyO3 0.28's MSRV is well under this, an *edition-2024* consumer crate needs ≥ 1.85, `maturin 1.14` wants ≥ 1.89, and `redis 1.2` wants ≥ 1.88 — `1.96.0` clears all of them.)
   - ✅ Done when: `rustc --version` prints `1.96.0` inside the repo (rustup may download it on first use).
 
 - [ ] Confirm `rustfmt` and `clippy` are available now that the toolchain lists them.
@@ -140,6 +147,7 @@ You already did the warm-up and the first M0 steps, so a partial workspace is on
   ```
   - 🆕 Concept: `thiserror.workspace = true` pulls the pin from `[workspace.dependencies]`. (Rust Book: Cargo Workspaces)
   - ⚠️ Invariant #8: "Keep Python out of the core — `droplet-core` must never depend on `pyo3`." Notice there is **no** `pyo3` here, and there never will be. Also note: **no `anyhow`** in a library — invariant #10 reserves `anyhow` for binaries.
+    - Caveat (at monty `v0.0.18`): pyo3 *does* appear **transitively** in `droplet-core`'s tree via monty's `jiter` dep. So "no pyo3" here means "`droplet-core` writes no pyo3 code / never `use`s pyo3", **not** "pyo3 is absent from the dependency tree". You never add `pyo3` to this `[dependencies]` table — that's the rule that holds.
   - ✅ Done when: `cargo build -p droplet-core` prints `Finished`.
 
 ---
@@ -604,10 +612,11 @@ Now add the **second** crate. `droplet-py` is the **only** place `pyo3` is allow
 
 - [ ] Add `pyo3` to the root `[workspace.dependencies]` with the cdylib feature set:
   ```toml
-  pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+  pyo3 = { version = "0.28", features = ["abi3-py310"] }
   ```
-  - 🆕 Concept: PyO3's `extension-module` feature tells PyO3 **not** to link `libpython` directly (Python supplies the symbols at import). `abi3-py310` builds **one** stable-ABI wheel that runs on CPython ≥ 3.10 (instead of one wheel per Python version). (No Rust Book chapter — see https://pyo3.rs.)
-  - ⚠️ Invariant #8: this dep belongs **only** to `droplet-py`. Do not add `pyo3` to `droplet-core`.
+  - ⚠️ **The `0.28` pin is load-bearing (NOT `0.29`).** monty `v0.0.18` transitively pulls pyo3 `0.28.x` via its `jiter` JSON dep, and `pyo3-ffi` declares `links = "python"` — Cargo allows only **one** crate with a given `links` value in the graph, so the whole workspace must agree on one pyo3 version. Pinning `0.29` here gives `failed to select a version for pyo3-ffi ... conflicts with ... links python`. Match monty: `0.28`.
+  - ⚠️ **No `extension-module` feature.** It is *deprecated*: it tells pyo3 not to link `libpython`, which breaks plain `cargo build`/`cargo test --workspace` (the test binary has no Python to resolve symbols against). Dropping it lets cargo link libpython normally, and maturin (≥ 1.9.4) builds the actual extension module for you (it sets `PYO3_BUILD_EXTENSION_MODULE` itself). `abi3-py310` stays: it builds **one** stable-ABI wheel that runs on CPython ≥ 3.10 (instead of one wheel per Python version). (No Rust Book chapter — see https://pyo3.rs.)
+  - ⚠️ Invariant #8: this dep belongs **only** to `droplet-py`'s `[dependencies]`. Do not add `pyo3` to `droplet-core` (it appears there only transitively via monty — see Chunk B).
 
 - [ ] Make `droplet-py` a `cdylib`. Edit `crates/droplet-py/Cargo.toml`:
   ```toml
@@ -637,7 +646,7 @@ Now add the **second** crate. `droplet-py` is the **only** place `pyo3` is allow
   #[pyfunction]
   fn add(a: u64, b: u64) -> u64 { a + b }
 
-  // Function-style #[pymodule]: the param is &Bound<'_, PyModule> (current 0.29 API).
+  // Function-style #[pymodule]: the param is &Bound<'_, PyModule> (current 0.28 API).
   #[pymodule]
   fn _droplet(m: &Bound<'_, PyModule>) -> PyResult<()> {
       m.add_function(wrap_pyfunction!(add, m)?)?;
@@ -645,10 +654,9 @@ Now add the **second** crate. `droplet-py` is the **only** place `pyo3` is allow
   }
   ```
   - 🆕 Concept: `#[pyfunction]`/`#[pymodule]` are PyO3 proc-macros generating the C glue so Python can call Rust; `wrap_pyfunction!` registers a function into the module. (https://pyo3.rs)
-  - 🆕 Concept: `Bound<'py, T>` is PyO3 0.29's GIL-bound smart pointer to a Python object. The `#[pymodule]` fn takes `&Bound<'_, PyModule>` — older `&PyModule` "GIL Refs" snippets are pre-0.21 and won't compile.
-  - ⚠️ Gotcha (the GIL-rename, invariant #9): PyO3 0.26 renamed `allow_threads → detach`, `with_gil → attach`, `prepare_freethreaded_python → Python::initialize`, with **no** deprecated aliases. On 0.29 only the new names exist. You don't need them yet (the real GIL-release wrapping lands when DuckDB does in M1), but every stale tutorial uses `allow_threads` — use `detach`.
-  - ✅ Done when: `cargo build -p droplet-py` is green (compiles the cdylib; doesn't install into Python yet).
-  - Note (`extension-module` + `cargo test`): the `extension-module` feature makes a pure-Rust unit-test binary fail to link (no libpython). For M0 the smoke test is the Python-side import below, so this is fine. If you later add Rust unit tests here, gate `extension-module` behind an optional feature maturin turns on but `cargo test` leaves off. verify: confirm this is still the recommended pattern in the PyO3 0.29 "building & distribution" guide.
+  - 🆕 Concept: `Bound<'py, T>` is PyO3 0.28's GIL-bound smart pointer to a Python object. The `#[pymodule]` fn takes `&Bound<'_, PyModule>` — older `&PyModule` "GIL Refs" snippets are pre-0.21 and won't compile.
+  - ⚠️ Gotcha (the GIL-rename, invariant #9): PyO3 0.26 renamed `allow_threads → detach`, `with_gil → attach`, `prepare_freethreaded_python → Python::initialize`, with **no** deprecated aliases. On 0.28 only the new names exist. You don't need them yet (the real GIL-release wrapping lands when DuckDB does in M1), but every stale tutorial uses `allow_threads` — use `detach`.
+  - ✅ Done when: `cargo build -p droplet-py` is green (compiles the cdylib; doesn't install into Python yet). Because the **`extension-module` feature is dropped** (see the pyo3 step above), this links libpython via plain cargo and is green **without any special handling on macOS** — the old macOS undefined-`_PyXxx`-symbols link error only happens *with* `extension-module` on (when libpython isn't linked). CI just needs a Python present (Chunk I).
 
 - [ ] Add `crates/droplet-py/pyproject.toml` so maturin can package the wheel:
   ```toml
@@ -658,14 +666,32 @@ Now add the **second** crate. `droplet-py` is the **only** place `pyo3` is allow
 
   [project]
   name            = "droplet"
+  version         = "0.0.1"
   requires-python = ">=3.10"
 
   [tool.maturin]
-  module-name = "droplet._droplet"   # matches the [lib] name and #[pymodule] fn
+  python-source = "python"           # mixed project: the `droplet` package lives here
+  module-name   = "droplet._droplet" # native lib placed inside it; matches the [lib] name + #[pymodule] fn
   ```
   - 🆕 Concept: a *wheel* (`.whl`) is Python's binary install artifact. maturin compiles your cdylib and packages it, then can install it into the active virtualenv. (https://maturin.rs)
   - ⚠️ Gotcha: `requires-python = ">=3.10"` must agree with `abi3-py310` — both say "CPython 3.10+." A mismatch makes pip mis-resolve the wheel. (Current maturin is `1.14`; the `>=1.14,<2.0` bound covers it.)
-  - ✅ Done when: the file exists with the three tables.
+  - verify (build-disproved guesses, both required by maturin 1.14): **maturin 1.14 errors without `[project] version`** — you must set `version = "0.0.1"`. And the dotted `module-name = "droplet._droplet"` requires the **`python-source = "python"`** mixed-project layout (a `python/droplet/` package directory the native lib is placed *inside*). Without `python-source`, a pure-Rust layout would instead expose the module as top-level `_droplet` (imported as `import _droplet`, not `droplet._droplet`).
+  - ✅ Done when: the file exists with `[project] version` set and `[tool.maturin] python-source` + `module-name`.
+
+- [ ] Create the pure-Python package the native lib drops into: `crates/droplet-py/python/droplet/__init__.py`. Because `python-source = "python"` and `module-name = "droplet._droplet"`, maturin places the compiled `_droplet` *inside* this `droplet` package. Re-export from the native module so both import paths work:
+  ```python
+  """Droplet Python SDK.
+
+  M0 just re-exports the native module. The real SDK surface (Catalog, Session,
+  backend + connector config) grows here in later milestones (PRODUCT.md §17).
+  """
+
+  from ._droplet import add
+
+  __all__ = ["add"]
+  ```
+  - 🆕 Concept: this is the **mixed (Rust + Python) project** layout — the hand-written `droplet/` package wraps the compiled `_droplet` extension. The `from ._droplet import add` re-export means `from droplet._droplet import add` **and** `from droplet import add` both work; later milestones grow the public SDK surface in this file without recompiling Rust. (https://maturin.rs — "Mixed Rust/Python projects".)
+  - ✅ Done when: the file exists. (It can't be imported until `maturin develop` builds `_droplet` below.)
 
 - [ ] Create and activate a Python virtualenv:
   ```bash
@@ -688,11 +714,12 @@ Now add the **second** crate. `droplet-py` is the **only** place `pyo3` is allow
   - 🆕 Concept: `maturin develop` compiles **and** installs into the active venv (fast inner loop); `maturin build` just emits a distributable `.whl` in `target/wheels/` without installing. Use `develop` while iterating.
   - ✅ Done when: it prints success.
 
-- [ ] Import it from Python and call the function:
+- [ ] Import it from Python and call the function — both paths work thanks to the `__init__.py` re-export:
   ```bash
   python -c "from droplet._droplet import add; print(add(2, 3))"
+  python -c "from droplet import add; print(add(2, 3))"
   ```
-  - ✅ Done when: it prints `5`. **This is the first half of the M0 "Done when": `maturin develop` is green and Python can call into Rust.**
+  - ✅ Done when: each prints `5`. **This is the first half of the M0 "Done when": `maturin develop` is green and Python can call into Rust.**
 
 ---
 
@@ -702,7 +729,9 @@ This adds the **real** sandboxed interpreter (`monty`) to `droplet-core` and pro
 
 > ⚠️ **MONTY DEPENDENCY TRAP:** crates.io `monty 0.0.0` is a placeholder ("Coming soon"), **not** the interpreter — `cargo add monty` will not compile against the real API. Depend on it via **git, pinned to tag `v0.0.18`**. verify: re-confirm `v0.0.18` is the latest tag before pinning (the digest verified it latest, released 2026-05-29, but the repo is pre-1.0). The real "docs" are the GitHub README and the source under `crates/monty/src/*.rs`; docs.rs shows nothing useful.
 >
-> The signatures below are the digest's **most-likely shape at `v0.0.18`**. The API is pre-1.0 and churns every few weeks. **`verify:` every name against the source** (`crates/monty/src/repl.rs`, `run_progress.rs`, `resource.rs`) before relying on it. Heads-up: this dep drags in Astral's `ty`/`ruff` (a custom Ruff fork) and `salsa` crates, so the **first build is long** — that's normal. **Commit `Cargo.lock`** afterward and avoid `cargo update` on this tree.
+> ✅ **Verified at `v0.0.18`:** the core `monty` crate also pulls **pyo3 `0.28.x` transitively** via its `jiter` JSON dep — this is *why* the workspace pins pyo3 `0.28` (Chunk G), since `pyo3-ffi`'s `links = "python"` allows only one pyo3 version graph-wide. Good news: the core `monty` crate itself **built fast (~10s)**. The heavy `ty`/`ruff`/`salsa` tree is only pulled by the **`monty-type-checking`/`monty-cli`** crates, **not** the core `monty` crate M0 depends on — so M0's build is *not* the long one the original draft warned about. (That long build returns in M3 when the type-check path is wired.) **Commit `Cargo.lock`** afterward and avoid `cargo update` on this tree.
+>
+> The signatures below are now the **real `v0.0.18` API** (verified against `crates/monty/src/{repl,run_progress,object,io,resource,exception_public}.rs` while building M0), not guesses — but the API is pre-1.0 and churns every few weeks, so still skim the source if you pin a newer tag.
 
 - [ ] Add the git dependency to the root `[workspace.dependencies]`:
   ```toml
@@ -714,98 +743,158 @@ This adds the **real** sandboxed interpreter (`monty`) to `droplet-core` and pro
 
 - [ ] Opt into `monty` from `crates/droplet-core/Cargo.toml` under `[dependencies]`: `monty.workspace = true`. Then run `cargo build -p droplet-core`.
   - ⚠️ Invariant #8: do **not** add the PyO3 binding crate (the `monty-python` / `pydantic_monty` PyPI binding) — it would pull pyo3 into core and break the firewall. Use the pure-Rust `monty` core crate only. No feature flags needed for M0.
-  - ✅ Done when: `cargo build -p droplet-core` resolves and downloads `monty` from git (slow first fetch is normal). This step defeats the placeholder-crate trap.
+  - ✅ Done when: `cargo build -p droplet-core` resolves and downloads `monty` from git (the git clone is the slow part; the core `monty` crate then compiles in ~10s — the heavy `ty`/`ruff`/`salsa` tree is **not** pulled by the core crate). This step defeats the placeholder-crate trap.
 
-- [ ] **Verify the core type/function names against the source before writing code.** Open `crates/monty/src/repl.rs`, `run_progress.rs`, `resource.rs` at tag `v0.0.18` and confirm the spellings of: `MontyRepl`, `MontyObject`, `ReplProgress`, `NoLimitTracker`, `LimitedTracker`, `ResourceLimits`, `PrintWriter`, `ExtFunctionResult`, `MontyException`, `NameLookupResult`.
-  - verify: the digest's "most-likely" shapes — treat the snippets below as a sketch, the source as truth, and note any name that differs before continuing.
-  - ✅ Done when: you've eyeballed the real signatures and written down any deviation.
+- [ ] **Verify the core type/function names against the source before writing code.** Open `crates/monty/src/repl.rs`, `run_progress.rs`, `resource.rs` at tag `v0.0.18` and confirm the spellings of: `MontyRepl`, `MontyObject`, `ReplProgress`, `NoLimitTracker`, `ResourceTracker`, `PrintWriter`, `ExtFunctionResult`, `MontyException`, `NameLookupResult`, `ReplStartError`.
+  - ✅ **Confirmed at `v0.0.18`** (the snippets below match the committed `sandbox.rs`): `MontyRepl<T>` is **generic over a `ResourceTracker`** (M0 uses `NoLimitTracker`); `feed_run`/`feed_start`/`resume` exist with the signatures shown below; `PrintWriter` is an enum (`Disabled`/`Stdout`/`CollectString`/`CollectStreams`/`Callback`); `ReplProgress<T>` has the five variants below; `ExtFunctionResult` is the `Return`/`Error`/`Future`/`NotFound` enum below; `MontyException` implements `std::error::Error` (so `#[from]` works); `feed_start`/`resume` errors are `Box<ReplStartError<T>>`. If you pin a *newer* tag, re-confirm — pre-1.0.
+  - ✅ Done when: you've eyeballed the real signatures and noted any deviation from a newer tag.
 
-- [ ] Create `crates/droplet-core/src/sandbox.rs`, declare `pub mod sandbox;` in `lib.rs`, and write a smoke test using the **persistent REPL** (`MontyRepl`) to run `1 + 2`:
+- [ ] Create `crates/droplet-core/src/sandbox.rs`, declare `pub mod sandbox;` in `lib.rs`, and write a smoke test using the **persistent REPL** (`MontyRepl`) to run `1 + 2`. Everything in M0 lives under `#[cfg(test)]` (M3 promotes this loop into the real `run_code` driver — M0 just proves the seam):
   ```rust
-  use monty::{MontyRepl, MontyObject, NoLimitTracker, PrintWriter};
-
   #[cfg(test)]
   mod tests {
-      use super::*;
+      use monty::{MontyObject, MontyRepl, NoLimitTracker, PrintWriter};
+
+      /// M0 uses the unbounded resource tracker; M3/later wire real limits.
+      type Repl = MontyRepl<NoLimitTracker>;
+
+      fn new_repl() -> Repl {
+          MontyRepl::new("session.py", NoLimitTracker)
+      }
 
       #[test]
       fn repl_runs_trivial_expression() {
           // feed_run runs a chunk to a single value (no external-fn pauses).
-          let mut repl = MontyRepl::new("session.py", NoLimitTracker);
-          let v = repl.feed_run("1 + 2", vec![], PrintWriter::Stdout).unwrap();
+          // It returns the MontyException directly (no Box) — fold with `?` later.
+          let mut repl = new_repl();
+          let v = repl.feed_run("1 + 2", vec![], PrintWriter::Disabled).unwrap();
           assert_eq!(v, MontyObject::Int(3));
       }
   }
   ```
-  - 🆕 Concept: **`MontyRepl`** is the *persistent* session that runs successive code chunks and keeps variables alive between them — the model Droplet's per-`run_code`-step design needs (vs `MontyRun`, which runs one program). (Monty README.)
-  - 🆕 Concept: `feed_run(code, inputs, print)` runs a chunk to a final value with **no** external-function pauses you handle; `feed_start` (next step) returns a `ReplProgress` you loop over to service host calls. Use `feed_run` for this pure smoke test.
-  - 🆕 Concept: `MontyObject` is Monty's value type (an enum: `Int`, `Str`, …). Python values cross the boundary as `MontyObject`, never as native Rust types.
+  - 🆕 Concept: **`MontyRepl<T>`** is the *persistent* session that runs successive code chunks and keeps variables alive between them — the model Droplet's per-`run_code`-step design needs (vs `MontyRun`, which runs one program). It is **generic over a `ResourceTracker`** `T` (CPU/allocation limits); M0 uses `NoLimitTracker` and a `type Repl = MontyRepl<NoLimitTracker>;` alias so the long generic doesn't repeat. M3 swaps in a real limited tracker. (Monty README + `resource.rs`.)
+  - 🆕 Concept: `feed_run(&mut self, code, inputs, print) -> Result<MontyObject, MontyException>` runs a chunk to a final value with **no** external-function pauses you handle; pass `vec![]` for no inputs. `feed_start` (next step) returns a `ReplProgress` you loop over to service host calls. Use `feed_run` for this pure smoke test. (Note: `feed_run` returns a **bare** `MontyException`, *not* `Box<ReplStartError>` — that boxed error is only from `feed_start`/`resume`.)
+  - 🆕 Concept: `PrintWriter` is an enum of print sinks — `Disabled` / `Stdout` / `CollectString` / `CollectStreams` / `Callback`. The tests use **`PrintWriter::Disabled`** (M0 doesn't assert on stdout); the real driver picks a collecting variant in M3.
+  - 🆕 Concept: `MontyObject` is Monty's value type (an enum: `Int(i64)`, `Str`, `None`, …). Python values cross the boundary as `MontyObject`, never as native Rust types.
   - ⚠️ Practical note (Monty subset): Monty runs a *subset* of Python — no classes, no third-party imports, limited stdlib (`sys`/`os`/`typing`/`asyncio`/`re`/`datetime`/`json` + `open()` at v0.0.18). Keep test scripts tiny and inside the subset. verify: re-read the README "limitations" at the exact tag — the supported-module list changes release to release.
-  - verify: `MontyRepl::new(script_name, tracker)` arg order and that `feed_run` takes `&mut self` — both per the digest; confirm in `repl.rs`.
   - ✅ Done when: `cargo test -p droplet-core` passes the smoke test. The interpreter works end-to-end.
 
 - [ ] Prove **state persists across chunks** (the per-step REPL model):
   ```rust
   #[test]
   fn repl_state_persists() {
-      let mut r = MontyRepl::new("session.py", NoLimitTracker);
-      r.feed_run("x = 10", vec![], PrintWriter::Stdout).unwrap();
-      r.feed_run("y = 20", vec![], PrintWriter::Stdout).unwrap();
-      let v = r.feed_run("x + y", vec![], PrintWriter::Stdout).unwrap();
+      let mut r = new_repl();
+      r.feed_run("x = 10", vec![], PrintWriter::Disabled).unwrap();
+      r.feed_run("y = 20", vec![], PrintWriter::Disabled).unwrap();
+      let v = r.feed_run("x + y", vec![], PrintWriter::Disabled).unwrap();
       assert_eq!(v, MontyObject::Int(30));
   }
   ```
   - 🔗 Maps to: each `run_code(code)` step feeds the same REPL; variables defined in one step are visible in the next. This is why a session is *durable but ephemeral*.
   - ✅ Done when: the test passes.
 
-- [ ] Switch to the **suspend/resume loop** with `feed_start`, handling a fake external function. Feed Python that calls an undefined function (e.g. `host_get(5)`); in the `ReplProgress::FunctionCall` arm, return a hardcoded `MontyObject`, and `resume`. Cover the other arms with safe defaults so nothing panics:
+- [ ] Switch to the **suspend/resume loop** with `feed_start`, handling a fake external function. Feed Python that calls an undefined function (e.g. `host_get(5)`); in the `ReplProgress::FunctionCall` arm, return a hardcoded `MontyObject`, and `resume`. Cover the other arms with safe defaults so nothing panics. First, two helpers: an alias-friendly `new_repl()` (above) and a `start_err` that folds `feed_start`/`resume`'s **boxed** error into `DropletError`:
   ```rust
-  use monty::ReplProgress;
+  use monty::{ExtFunctionResult, NameLookupResult, ReplProgress, ReplStartError};
+  use crate::DropletError;
 
-  let mut progress = repl.feed_start("host_get(5)", vec![], PrintWriter::Stdout)?;
-  let value = loop {
-      match progress {
-          ReplProgress::Complete { repl: r, value } => { repl = r; break value; }
-          ReplProgress::FunctionCall(call) => {
-              let reply: monty::ExtFunctionResult = match call.function_name.as_str() {
-                  "host_get" => MontyObject::Int(123).into(),
-                  other => unimplemented!("unknown extern fn: {other}"),
-              };
-              progress = call.resume(reply, PrintWriter::Stdout)?;
-          }
-          // Safe defaults for the other suspension kinds (fill in only if a test needs them):
-          ReplProgress::OsCall(c)         => { progress = c.resume(MontyObject::None.into(), PrintWriter::Stdout)?; }
-          ReplProgress::NameLookup(l)     => { progress = l.resume(monty::NameLookupResult::Undefined, PrintWriter::Stdout)?; }
-          ReplProgress::ResolveFutures(f) => {
-              let r: Vec<(u32, monty::ExtFunctionResult)> =
-                  f.pending_call_ids().iter().map(|&id| (id, MontyObject::None.into())).collect();
-              progress = f.resume(r, PrintWriter::Stdout)?;
+  /// feed_start/resume return `Box<ReplStartError<T>>` (which carries the surviving
+  /// REPL + the `MontyException`). Fold the exception into the one boundary error
+  /// type (invariant #10).
+  fn start_err(e: Box<ReplStartError<NoLimitTracker>>) -> DropletError {
+      let ReplStartError { error, .. } = *e;
+      DropletError::Monty(error)
+  }
+
+  /// Run one snippet that may call host functions (mutating shared `counter`), and
+  /// hand the REPL back so the session can keep feeding snippets.
+  fn drive(repl: Repl, code: &str, counter: &mut i64) -> Result<(MontyObject, Repl), DropletError> {
+      let mut progress = repl
+          .feed_start(code, vec![], PrintWriter::Disabled)
+          .map_err(start_err)?;
+      loop {
+          match progress {
+              ReplProgress::Complete { repl, value } => return Ok((value, repl)),
+              ReplProgress::FunctionCall(call) => {
+                  // The sandbox sees only the name + args; host state stays here.
+                  let reply: ExtFunctionResult = match call.function_name.as_str() {
+                      "host_get" => MontyObject::Int(123).into(),
+                      "host_add" => {
+                          if let Some(MontyObject::Int(n)) = call.args.first() {
+                              *counter += *n;
+                          }
+                          MontyObject::Int(*counter).into()
+                      }
+                      other => ExtFunctionResult::NotFound(other.to_string()),
+                  };
+                  progress = call.resume(reply, PrintWriter::Disabled).map_err(start_err)?;
+              }
+              // Safe defaults for the other suspension kinds (M0 tests don't hit them).
+              ReplProgress::OsCall(call) => {
+                  progress = call.resume(MontyObject::None, PrintWriter::Disabled).map_err(start_err)?;
+              }
+              ReplProgress::NameLookup(lookup) => {
+                  progress = lookup.resume(NameLookupResult::Undefined, PrintWriter::Disabled).map_err(start_err)?;
+              }
+              ReplProgress::ResolveFutures(futures) => {
+                  let results: Vec<(u32, ExtFunctionResult)> = futures
+                      .pending_call_ids()
+                      .iter()
+                      .map(|&id| (id, ExtFunctionResult::Return(MontyObject::None)))
+                      .collect();
+                  progress = futures.resume(results, PrintWriter::Disabled).map_err(start_err)?;
+              }
           }
       }
-  };
+  }
   ```
-  - 🆕 Concept: external host functions are **not** registered closures (the Rust side has no register-functions API; the Python `external_functions=` dict is a convenience in the PyO3 binding only). Execution *pauses* and hands you a `ReplProgress` state machine; you `match` it in a `loop`. `Complete { repl, value }` ends the run *and hands the REPL back* (because `feed_start` consumes `self`); `FunctionCall(call)` asks you to compute, then `call.resume(reply, …)` continues. This is the seam every tool (`load`, the analyze prims, `export`) plugs into in **M3**. (Rust Book: The `match` Control Flow Construct; Repetition with Loops)
-  - 🆕 Concept: `MontyObject::Int(123).into()` builds an `ExtFunctionResult` (the value handed back to the sandbox) via a `From` impl. (verify the `From` impls and whether a tool can *raise* a sandbox exception — Droplet needs load/analyze errors to surface as catchable exceptions later.)
+  - 🆕 Concept: external host functions are **not** registered closures (the Rust side has no register-functions API; the Python `external_functions=` dict is a convenience in the PyO3 binding only). Execution *pauses* and hands you a `ReplProgress<T>` state machine; you `match` it in a `loop`. `Complete { repl, value }` ends the run *and hands the REPL back* (because `feed_start(self, …)` **consumes** `self`); `FunctionCall(call)` asks you to compute, then `call.resume(reply, …)` continues. This is the seam every tool (`load`, the analyze prims, `export`) plugs into in **M3**. (Rust Book: The `match` Control Flow Construct; Repetition with Loops)
+  - 🆕 Concept: the five `ReplProgress<T>` variants are `Complete { repl, value }`, `FunctionCall(ReplFunctionCall<T>)`, `OsCall(ReplOsCall<T>)`, `NameLookup(ReplNameLookup<T>)`, and `ResolveFutures(ReplResolveFutures<T>)`. On a `ReplFunctionCall` you read `call.function_name: String` (use `.as_str()`) and `call.args: Vec<MontyObject>` (`call.args.first()`). `NameLookupResult` is `{ Value, Undefined }`; `ResolveFutures` exposes `pending_call_ids() -> &[u32]` and `resume(Vec<(u32, ExtFunctionResult)>, print)`.
+  - 🆕 Concept: `ExtFunctionResult` is an enum — `Return(MontyObject)`, `Error(MontyException)`, `Future(u32)`, `NotFound(String)`. It has `impl From<MontyObject>` (→ `Return`) and `impl From<MontyException>` (→ `Error`), so `MontyObject::Int(123).into()` and `some_exception.into()` both build one. An *unknown* function name returns `ExtFunctionResult::NotFound(name)` (don't `unimplemented!()`). A tool can thus *raise* a sandbox exception by returning `Error(MontyException)` — exactly what load/analyze errors will use later.
+  - 🆕 Concept: `feed_start`/`resume`/`call.resume`/`futures.resume` all return `Result<ReplProgress<T>, Box<ReplStartError<T>>>` — the error is **boxed** and carries the surviving `repl` plus an `error: MontyException` field. The `start_err` helper destructures it (`let ReplStartError { error, .. } = *e;`) and folds the exception via `DropletError::Monty(error)`. This is *not* a bare `MontyException` (that's what the simpler `feed_run` returns) — don't try to `?` the boxed error straight into `DropletError`.
   - ⚠️ Invariant #6: the sandbox sees only the function name + `MontyObject` args; engine objects/handles stay entirely in your match arm, host-side. This dispatch *is* the boundary.
-  - verify: the full `ReplProgress` variant set and that `feed_start` consumes `self` and returns the REPL inside `Complete` — both per the digest; confirm against `run_progress.rs`/`repl.rs` at the tag. The `NameLookup`/`ResolveFutures` resume shapes especially.
   - ✅ Done when: a test runs Python calling `host_get(5)` and gets `123` back through the loop; `cargo test -p droplet-core` is green.
-
-- [ ] **Call one host function over shared `Session` state — the literal M0 goal.** Add a host counter to (or reachable from) the session, dispatch a `host_add(n)` external function that **mutates** it, and return the new total. The smallest version mutates a `&mut i64` you thread into the loop; the real version mutates state inside the `Session`:
   ```rust
-  // In the FunctionCall arm, alongside "host_get":
-  // "host_add" => {
-  //     if let Some(MontyObject::Int(n)) = call.args.first() { *counter += *n; }
-  //     MontyObject::Int(*counter).into()
-  // }
+  #[test]
+  fn host_function_returns_value() {
+      let mut counter = 0;
+      let (v, _repl) = drive(new_repl(), "host_get(5)", &mut counter).unwrap();
+      assert_eq!(v, MontyObject::Int(123));
+  }
   ```
-  - 🆕 Concept: passing `&mut` host state into the loop lets the host function read and *mutate* state the sandbox can never touch directly — the same pattern the handle registry generalizes. The sandbox sends a name + args; the host mutates real state behind the seam. (Rust Book: References and Borrowing)
-  - 🆕 Concept: `call.args` is a `Vec<MontyObject>`; `if let Some(MontyObject::Int(n)) = call.args.first()` reads the first arg only when it's an `Int`. (verify the field name `args`/`kwargs` shape in source.)
-  - ⚠️ Invariant #6 + §14 isolation: the shared state (a counter now; the DuckDB connection, registry, and connector later) lives host-side in the `Session`; the sandbox influences it only through the explicit named call.
-  - ✅ Done when: a test calls `host_add(5)` then `host_add(7)` and asserts the returned total is `12` — proving "call one host function over shared session state." **This is the M0 "Done when" finish line for the Rust side.**
 
-- [ ] Fold Monty's error into `DropletError` (invariant #10). Uncomment/add the `Monty(#[from] monty::MontyException)` variant, change your run helper to return `Result<MontyObject, DropletError>`, and replace `.unwrap()` with `?`.
+- [ ] **Call one host function over shared `Session` state — the literal M0 goal.** The `host_add` arm is already in the `drive` helper above: it reads `call.args.first()`, mutates the threaded `&mut i64 counter`, and returns the new total. Now prove it persists *across snippets* by threading the **same** `counter` (and the handed-back REPL) through two `drive` calls. The smallest version mutates a `&mut i64`; the real version mutates state inside the `Session`:
+  ```rust
+  #[test]
+  fn host_function_mutates_shared_state() {
+      // The literal M0 goal: call one host function over shared session state.
+      let mut counter = 0;
+      let (_v, repl) = drive(new_repl(), "host_add(5)", &mut counter).unwrap();
+      let (v2, _repl) = drive(repl, "host_add(7)", &mut counter).unwrap();
+      assert_eq!(counter, 12);
+      assert_eq!(v2, MontyObject::Int(12));
+  }
+  ```
+  - 🆕 Concept: passing `&mut` host state into the loop lets the host function read and *mutate* state the sandbox can never touch directly — the same pattern the handle registry generalizes. The sandbox sends a name + args; the host mutates real state behind the seam. Threading the returned `repl` (from `Complete { repl, .. }`) into the next `drive` call is what keeps the *session* alive across snippets. (Rust Book: References and Borrowing)
+  - 🆕 Concept: `call.args` is a `Vec<MontyObject>`; `if let Some(MontyObject::Int(n)) = call.args.first()` reads the first arg only when it's an `Int`.
+  - ⚠️ Invariant #6 + §14 isolation: the shared state (a counter now; the DuckDB connection, registry, and connector later) lives host-side in the `Session`; the sandbox influences it only through the explicit named call.
+  - ✅ Done when: the test calls `host_add(5)` then `host_add(7)` and asserts the returned total is `12` — proving "call one host function over shared session state." **This is the M0 "Done when" finish line for the Rust side.**
+
+- [ ] Fold Monty's error into `DropletError` (invariant #10). Add the `Monty(#[from] monty::MontyException)` variant, change your run helper to return `Result<MontyObject, DropletError>`, and replace `.unwrap()` with `?`:
+  ```rust
+  #[test]
+  fn monty_error_folds_into_droplet_error() {
+      fn run(code: &str) -> Result<MontyObject, DropletError> {
+          let mut r = new_repl();
+          // feed_run returns MontyException; `?` folds it via #[from] (invariant #10).
+          Ok(r.feed_run(code, vec![], PrintWriter::Disabled)?)
+      }
+      // A bare undefined name raises NameError inside feed_run.
+      assert!(matches!(run("undefined_name + 1"), Err(DropletError::Monty(_))));
+  }
+  ```
+  - ✅ **Confirmed:** `monty::MontyException` implements `std::error::Error`, so `#[from]` compiles and generates `From<MontyException> for DropletError`. Two error shapes to keep straight: **`feed_run` returns a bare `MontyException`** (so `?` folds it directly via `#[from]`, as above), but **`feed_start`/`resume` return `Box<ReplStartError<T>>`** (the boxed error with the surviving REPL) — those go through the `start_err` helper, which pulls out the `error` field and calls `DropletError::Monty(error)`.
   - ⚠️ Invariant #10: "all engine errors fold into DropletError." Monty is now folded in alongside `Io` and `NotFound`.
-  - verify: the exact type name `MontyException` (vs any rename on your tag) before adding the `#[from]`.
   - ✅ Done when: the helper signature is `Result<MontyObject, DropletError>` and tests still pass.
 
 - [ ] (Optional, easy plumbing check for M8) Confirm `dump`/`load` exist on the REPL at your tag: `let bytes = repl.dump()?;` then `let mut repl2 = MontyRepl::load(&bytes)?;`, feed a follow-up chunk on `repl2`, and assert it sees prior state.
@@ -880,12 +969,18 @@ Lock in quality with a minimal GitHub Actions workflow, and add the `xtask` bina
         - uses: dtolnay/rust-toolchain@stable
           with:
             components: rustfmt, clippy
+        # droplet-py links libpython (pyo3 without the deprecated extension-module
+        # feature), so the build needs a Python available to link against.
+        - uses: actions/setup-python@v5
+          with:
+            python-version: "3.12"
         - run: cargo fmt --check
         - run: cargo clippy --workspace --all-targets -- -D warnings
         - run: cargo build --workspace
         - run: cargo test --workspace
   ```
   - 🆕 Concept: GitHub Actions runs these checks on every push/PR in a clean Linux VM — catching "works on my machine" issues. (GitHub Actions docs.)
+  - ⚠️ The `actions/setup-python@v5` step is **required** and must come **before** the cargo steps: because `droplet-py` drops the `extension-module` feature, `cargo build`/`cargo test` link `libpython` directly, so the runner needs a Python (here 3.12) present to link against. Without it the `droplet-py` cdylib fails to link in CI.
   - Note: your `rust-toolchain.toml` pins `1.96.0`, so the runner uses it automatically when it reads the file. Expect the first CI run to be **slow** — it compiles `monty` + the bundled `ty`/`ruff`/`salsa` tree from scratch (cache the cargo registry/target later if it hurts). A separate `maturin build` job can come in M10.
   - ✅ Done when: you push a branch and the CI job goes green on GitHub.
 
@@ -900,7 +995,7 @@ Tick all of these to call M0 complete (this is the spec's BUILD ORDER step 1, ex
 - [ ] `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` are **clean**.
 - [ ] `maturin develop` installs the `_droplet` module, and `python -c "from droplet._droplet import add; print(add(2,3))"` prints **`5`** (invariant #8: pyo3 only in `droplet-py`).
 - [ ] The **`Source` connector trait** exists with a local-Parquet dev impl, held by a `Session` behind `Box<dyn Source>` (invariant #1 — the connector is why the agent never sees the engine). *(The `ArtifactStore`/`CoordinationStore`/`SnapshotStore` traits are deferred to M5/M7/M8.)*
-- [ ] A trivial **Monty** run inside `droplet-core` calls **one host function over shared session state** (e.g. `host_add` mutating a counter) and returns the expected total — entirely pure Rust, **no pyo3 in `droplet-core`** (invariants #1, #6, #8).
+- [ ] A trivial **Monty** run inside `droplet-core` calls **one host function over shared session state** (e.g. `host_add` mutating a counter) and returns the expected total — entirely pure Rust, **`droplet-core` writes no pyo3 code** (invariants #1, #6, #8). *(Caveat at monty `v0.0.18`: pyo3 `0.28.x` appears **transitively** in `droplet-core`'s tree via monty's `jiter` dep — so "no pyo3" means no pyo3 *code*/`use`, not pyo3 absent from the lockfile.)*
 - [ ] All engine/interpreter errors so far (`io::Error`, `MontyException`) fold into the single `DropletError` (invariant #10), with comment-stubs reserving the future `#[from]` variants (DuckDB/Surreal/S3/Redis/DynamoDB).
 - [ ] `Cargo.lock` is committed (it pins the `monty` git rev), and CI runs fmt + clippy + build + test on push/PR and is green.
 
