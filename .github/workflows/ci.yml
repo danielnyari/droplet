@@ -1,0 +1,19 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # droplet-py links libpython (pyo3 without the deprecated extension-module
+      # feature), so the build needs a Python available to link against.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      - run: cargo test --workspace
