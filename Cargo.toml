@@ -1,0 +1,10 @@
+
+[workspace]
+resolver = "3"                
+members = ["crates/droplet-core", "droplet-warmup"]
+
+[workspace.package]            
+edition = "2024"
+version = "0.0.1"
+license = "MIT"
+repository = "https://github.com/you/droplet"
