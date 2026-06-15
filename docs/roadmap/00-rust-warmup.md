@@ -3,9 +3,9 @@
 **Milestone goal:** learn *just enough* Rust to start building Droplet v1 — not all of Rust, only the
 handful of concepts the build leans on hardest. You'll do tiny exercises in the throwaway scratch crate
 you already created (`droplet-warmup`). Two ideas get extra depth because v1 rests on them: **traits +
-trait objects** (Droplet has *four* store traits, each with several backends) and **async/await +
-Tokio** (the S3, DynamoDB, Redis, and SurrealDB clients are all async; DuckDB is sync and must be
-fenced off with `spawn_blocking`).
+trait objects** (Droplet has a `Source` connector trait plus *three* store traits, and each has several
+backends) and **async/await + Tokio** (the connector IO, S3, DynamoDB, Redis, and SurrealDB clients are
+all async; DuckDB is sync and must be fenced off with `spawn_blocking`).
 
 **Done when:** you can write a small Rust program that uses structs + `impl`, `enum` + `match`,
 `Option`/`Result` with `?`, a `HashMap` registry, **defines a trait, implements it for two types, and
@@ -19,8 +19,8 @@ file: [`M0-skeleton.md`](./M0-skeleton.md). The spec is at [`PRODUCT.md`](../../
 **not** `docs/PRODUCT.md`).
 
 **Estimate:** ~10 chunks (a sitting each). You already program in Python, so the *new* parts are
-ownership/borrowing, the trait/`dyn` machinery behind the four store seams, and the async/Tokio model —
-everything else maps onto things you already know.
+ownership/borrowing, the trait/`dyn` machinery behind the `Source` connector + the store seams, and the
+async/Tokio model — everything else maps onto things you already know.
 
 ---
 
@@ -29,8 +29,9 @@ everything else maps onto things you already know.
 - Each `- [ ]` is a tiny task (~10–30 min, one idea). Do them in order; tick a box only when its **✅** is true.
 - **🆕 Concept** = a one-time plain-English explanation of a new idea, with a Rust Book chapter *name* to read.
 - **✅ Done when** = how you know the task worked (a command's output or a passing test).
-- **⚠️ Invariant** = a Droplet rule (one of the **10** in [`PRODUCT.md`](../../PRODUCT.md), §8) the
-  exercise quietly prepares you for, quoted in plain words with its number.
+- **⚠️ Invariant** = a Droplet rule (one of the **10** in [`PRODUCT.md`](../../PRODUCT.md), §15 — the
+  same 10 "Golden rules" listed in [`README.md`](./README.md)) the exercise quietly prepares you for,
+  quoted in plain words with its number.
 - **🔗 Maps to** = the real Droplet v1 concept this exercise unlocks — so you know *why* you're learning it.
 - **verify:** = a fact the research couldn't fully pin on the locked version; check the crate source/docs before relying on it.
 - The Rust Book is free (`rustup doc --book`, or search "The Rust Programming Language book"). Chapter
@@ -54,8 +55,9 @@ everything else maps onto things you already know.
 - [ ] Confirm the compiler and build tool: run `rustc --version` and `cargo --version`.
   - 🆕 Concept: `rustup` manages compiler versions (like `pyenv` manages Pythons); `cargo` is Rust's
     build tool + package manager (like `pip` + `venv` + `make` in one). (Rust Book: Getting Started)
-  - ✅ Done when: both print a version. Edition 2024 needs Rust **≥ 1.85.0**; the repo machine has
-    `1.96.0`, which is fine. (Droplet's `rust-toolchain.toml`, added in M0, pins exactly `1.96.0`.)
+  - ✅ Done when: both print a version. Edition 2024 needs Rust **≥ 1.85.0**, and later milestones push
+    the floor to **≥ 1.89** (maturin in M0), so any recent stable **≥ 1.89** is fine. (M0 adds a
+    `rust-toolchain.toml` that pins one exact version for everyone.)
 - [ ] Add the linter: run `rustup component add clippy`.
   - 🆕 Concept: `clippy` is a Rust-aware linter that catches common mistakes (like `ruff`/`flake8` for
     Python). (Rust Book: Appendix D — Useful Development Tools)
@@ -100,7 +102,7 @@ everything else maps onto things you already know.
   - 🔗 Maps to: **every engine object the sandbox sees is referenced by a `u64` handle** — DuckDB
     connections, capped result sets, materialized artifacts all live host-side and the sandbox only
     holds the `u64`. This is *the* Droplet primitive, so you'll type `u64` a lot.
-  - ⚠️ Invariant (#4): boundary discipline — engine objects live behind a handle registry; the sandbox
+  - ⚠️ Invariant (#6): boundary discipline — engine objects live behind a handle registry; the sandbox
     sees only opaque handles, never the engine object.
 - [ ] Add a tiny pure function above `main`: `fn double(n: u64) -> u64 { n * 2 }`, and call it.
   - 🆕 Concept: a function signature names each parameter's type and the return type after `->`.
@@ -189,10 +191,11 @@ everything else maps onto things you already know.
     that owns an ephemeral DuckDB, a read-only Surreal handle, its manifest, and its snapshot lifecycle.
   - ✅ Done when: `cargo build` is green with `Session` defined.
 - [ ] Write a test that creates a `Session::new()`, calls `advance(1)` twice, and asserts `2`.
-  - ⚠️ Invariant (#4): boundary discipline — keep values that cross the host↔sandbox line *small*;
+  - ⚠️ Invariant (#6): boundary discipline — keep values that cross the host↔sandbox line *small*;
     `advance` returns one `u64`, not a blob. Heavy data stays in the engines.
-  - ⚠️ Invariant (#9): per-run isolation — one run = one `Session`. This tiny struct stands in for that
-    one-per-run context (the real one owns an ephemeral DuckDB + a working dir wiped on close).
+  - ⚠️ Invariant (#3): analyze is local & ephemeral — one run = one `Session`. This tiny struct stands
+    in for that one-per-run context (the real one owns an ephemeral *local* DuckDB + a working dir wiped
+    on close).
   - ✅ Done when: `cargo test` is green and you can explain that `&mut self` is what let `advance`
     change the field.
 - [ ] Define an enum whose variants carry data:
@@ -201,7 +204,7 @@ everything else maps onto things you already know.
     ```
   - 🆕 Concept: an `enum` is a type that is *exactly one of* several variants, each able to carry its
     own data. This is how Rust models "one of these" safely. (Rust Book: Defining an Enum)
-  - 🔗 Maps to: this is literally Droplet's cache freshness policy (PRODUCT.md §5): `Versioned`
+  - 🔗 Maps to: this is literally Droplet's cache freshness policy (PRODUCT.md §13): `Versioned`
     (default), `Ttl(duration)`, `Passthrough` (never cache).
   - ✅ Done when: `cargo build` is green with `FreshnessPolicy` defined.
 - [ ] Write a function that `match`es on the enum:
@@ -217,16 +220,19 @@ everything else maps onto things you already know.
   - 🆕 Concept: `match` compares a value against patterns and runs the first arm that fits; it *forces*
     you to handle every variant (the compiler errors if you miss one). (Rust Book: The `match` Control
     Flow Construct)
-  - 🔗 Maps to: Monty's `ReplProgress` (M4) is exactly this shape — `Complete { value, .. }` vs
+  - 🔗 Maps to: Monty's `ReplProgress` (M3) is exactly this shape — `Complete { value, .. }` vs
     `FunctionCall(call)` vs `OsCall` / `NameLookup` / `ResolveFutures`. The Monty driver loop is a
     `match` over those variants, so this exercise *is* the warm-up for it.
+  - verify: the exact `ReplProgress` variant names (`Complete` / `FunctionCall` / `OsCall` /
+    `NameLookup` / `ResolveFutures`) are from Monty `v0.0.18` and may have changed — read
+    `crates/monty/src/` for the current enum before relying on them in M3.
   - ✅ Done when: a quick `#[test]` confirms `caches(&FreshnessPolicy::Passthrough) == false`.
 - [ ] Add a new variant `FreshnessPolicy::Manual` but DON'T update `caches`. Watch the compiler force
   you to handle it, then add the missing arm.
   - 🆕 Concept: compiler-enforced completeness is called *exhaustiveness* — `match` can't silently
     forget a case. (Rust Book: The `match` Control Flow Construct)
   - ✅ Done when: you see "non-exhaustive patterns", then a green build after adding the arm. (This is
-    exactly why the Monty driver loop in M4 can't silently forget a `ReplProgress` case.)
+    exactly why the Monty driver loop in M3 can't silently forget a `ReplProgress` case.)
 
 ---
 
@@ -238,7 +244,8 @@ everything else maps onto things you already know.
     lives in the type and the compiler makes you handle the `None` case. (Rust Book: The `Option` Enum
     and Its Advantages Over Null Values)
   - 🔗 Maps to: a cache-index lookup (`cache_key → artifact_key`) returns `Option<String>` — `None` is
-    a cache miss. You'll see this exact shape in M2/M3.
+    a cache miss. You'll see this exact shape in the content-addressed cache (M5) and the cache index in
+    the coordination store (M7).
   - ✅ Done when: `first_char("hi")` matches `Some('h')` and `first_char("")` matches `None`.
 - [ ] Use `?` on an `Option`:
   `fn first_upper(s: &str) -> Option<char> { let c = s.chars().next()?; Some(c.to_ascii_uppercase()) }`.
@@ -268,13 +275,15 @@ everything else maps onto things you already know.
     same shortcut you saw for `Option`, now for errors. (Rust Book: Recoverable Errors with Result)
   - ✅ Done when: feeding bad input to the inner function makes the outer one return that same `Err`
     without you writing a `match`.
-- [ ] Add the `thiserror` crate to the scratch crate: run `cargo add thiserror@2.0.18` inside
+- [ ] Add the `thiserror` crate to the scratch crate: run `cargo add thiserror` inside
   `droplet-warmup/`.
   - 🆕 Concept: `cargo add` writes a dependency into this crate's `Cargo.toml` (the warm-up crate has an
-    empty `[dependencies]` table, so this is your first dep). Pin the **2.x** major: the digest confirms
-    `thiserror = "2.0.18"` is current. (Lots of older snippets show `1.x` — the previous major; don't
-    follow them.) (Rust Book: Hello, Cargo!)
-  - ✅ Done when: `Cargo.toml` shows `thiserror = "2.0.18"` and `cargo build` downloads it cleanly.
+    empty `[dependencies]` table, so this is your first dep). Pin the **2.x** major (so `Cargo.toml` shows
+    `thiserror = "2"`). (Lots of older snippets show `1.x` — the previous major; don't follow them.) (Rust
+    Book: Hello, Cargo!)
+  - verify: confirm the current 2.x patch of `thiserror` on crates.io before pinning — only the **2.x**
+    major is approved here, not any specific patch.
+  - ✅ Done when: `Cargo.toml` shows a `thiserror = "2..."` entry and `cargo build` downloads it cleanly.
 - [ ] Define a real error enum with `thiserror`:
     ```rust
     #[derive(thiserror::Error, Debug)]
@@ -304,9 +313,11 @@ everything else maps onto things you already know.
     conversion code.
 
 > ℹ️ **Version pins to remember for later (don't act now, just know):** Droplet pins crate versions and
-> commits the lockfile. `thiserror = "2.0.18"` is the library error crate (the `2.x` major is current);
-> `anyhow = "1.0.102"` is its binary-side counterpart (used in `xtask`/CLI, *never* in `droplet-core` —
-> invariant #10). For the snapshot manifest (M7) the compact serializer is **`postcard`** (the
+> commits the lockfile. `thiserror` (the `2.x` major) is the library error crate; `anyhow` (the `1.x`
+> major) is its binary-side counterpart (used in `xtask`/CLI, *never* in `droplet-core` — invariant #10).
+> *verify: confirm the current 2.x patch of `thiserror` / 1.x patch of `anyhow` on crates.io before
+> pinning — only the 2.x (thiserror) and 1.x (anyhow) majors are approved.* For the snapshot manifest
+> (M8) the compact serializer is **`postcard`** (the
 > maintained, Monty-consistent choice — Monty itself uses `postcard 1.1`, and `bincode` is now
 > officially **unmaintained**, so don't pick it for new code). The content-addressing hash is
 > **`blake3`** (Chunk 10). You don't need any of these now.
@@ -330,7 +341,7 @@ everything else maps onto things you already know.
     Hash Maps)
   - 🔗 Maps to: **the handle registry is a `HashMap<u64, EngineObject>`** — the structure that keeps
     engine objects host-side while the sandbox holds only the `u64` key.
-  - ⚠️ Invariant (#4): engine objects live host-side behind the registry; the sandbox only ever gets a
+  - ⚠️ Invariant (#6): engine objects live host-side behind the registry; the sandbox only ever gets a
     `u64` handle back, never the object behind it.
   - ✅ Done when: `.get(&existing)` is `Some(&value)` and `.get(&missing)` is `None`.
 - [ ] Build a tiny registry: a struct holding a `HashMap<u64, String>` plus a `next: u64` counter, with
@@ -338,8 +349,8 @@ everything else maps onto things you already know.
   - 🆕 Concept: a `HashMap` + a counter is the idiom for "hand out incrementing ids" — each `insert`
     bumps `next` and uses the old value as the key. (Rust Book: Storing Keys with Associated Values in
     Hash Maps)
-  - ⚠️ Invariant (#8): distributed by default — state lives in the shared plane and is reconstructable;
-    a plain incrementing `u64` keyed in a map is the simplest such handle (M7 rebuilds engine state from
+  - ⚠️ Invariant (#7): distributed by default — state lives in the shared plane and is reconstructable;
+    a plain incrementing `u64` keyed in a map is the simplest such handle (M8 rebuilds engine state from
     the manifest, never from serialized engine heaps).
   - ✅ Done when: `cargo build` is green with `insert` defined.
 - [ ] Add `get(&self, id: u64) -> Option<&String>`, then a test that inserts two values, gets distinct
@@ -349,12 +360,17 @@ everything else maps onto things you already know.
 
 ---
 
-### Chunk 8 — Traits, generics, and trait objects (the four store seams)
+### Chunk 8 — Traits, generics, and trait objects (the `Source` connector + store seams)
 
-> Droplet v1 has **four** store traits — `Source`, `ArtifactStore`, `SnapshotStore`,
-> `CoordinationStore` — and each has *several* backends (S3 + local-for-dev; Redis + DynamoDB +
-> in-memory-for-dev). The code that uses a store doesn't care which backend it got, so the backend is
-> chosen at runtime and held behind a trait object. This chunk builds exactly that shape in miniature.
+> Droplet v1 leans on this shape in two places. First, the **`Source` connector trait** (M0): every
+> engine — Athena, Snowflake, BigQuery, Iceberg, plain S3 — is reached through one `Source` impl that
+> turns a scoped load into local Parquet, and M0 ships a **trivial local-Parquet dev connector** behind
+> it so the rest of the build runs with no cloud. Second, the **three store traits** —
+> `ArtifactStore` (M5), `CoordinationStore` (M7), `SnapshotStore` (M8) — each with *several* backends
+> (S3 + local-for-dev; Redis + DynamoDB + in-memory-for-dev). In every case the code that uses the seam
+> doesn't care which backend it got, so the backend is chosen at runtime and held behind a trait object.
+> This chunk builds exactly that shape in miniature. *(These traits are built across M0 and M5–M8, not
+> all at once in M0 — here you're just rehearsing the pattern they all share.)*
 
 - [ ] Define a trait and implement it for two types:
     ```rust
@@ -375,15 +391,16 @@ everything else maps onto things you already know.
         fn get(&self, key: &str) -> Option<Vec<u8>> { self.map.get(key).cloned() }
     }
     ```
-  - 🔗 Maps to: this is the dev/in-memory `ArtifactStore` you build in M0 — the simplest backend behind
+  - 🔗 Maps to: this is the dev/in-memory `ArtifactStore` you build in M5 — the simplest backend behind
     the trait, used so tests run without S3.
   - ✅ Done when: a `#[test]` does `put("k", vec![1,2])` then `get("k") == Some(vec![1,2])`.
 - [ ] Implement the **same trait** for a second backend that logs every write (a struct wrapping a
   `MemStore` plus a `Vec<String>` of "audit" lines). Prove both satisfy `Store`.
   - 🆕 Concept: one trait, many implementations — that's how Droplet swaps a backend (in-memory vs S3)
     without changing the calling code. (Rust Book: Traits: Defining Shared Behavior)
-  - 🔗 Maps to: the *same* `ArtifactStore` trait will have an S3 impl in M2 and a local-dir impl for
-    dev — different code, identical interface.
+  - 🔗 Maps to: the *same* `ArtifactStore` trait will have an S3/MinIO impl in M5 and an in-memory impl
+    for dev — different code, identical interface. (The `Source` connector trait in M0 is the very same
+    pattern: a local-Parquet dev impl first, real engine impls like Athena later in M6.)
   - ✅ Done when: a test exercises both impls through the same `put`/`get` calls.
 - [ ] Take a `Store` **by generic** (static dispatch): write
   `fn round_trip<S: Store>(s: &mut S, k: &str)` that puts then gets a value.
@@ -407,31 +424,33 @@ everything else maps onto things you already know.
     runs against in-memory stores in tests and S3/Redis/DynamoDB in production.
   - ✅ Done when: you loop over `stores`, calling `put`/`get` on each through the `dyn Store` interface,
     and it compiles and runs.
-  - verify: when these traits go **async** (Chunk 9, and M2–M4 for real), native `async fn` in traits is
-    stable but **not** dyn-compatible, so a `Box<dyn ArtifactStore>` with an `async fn` method won't
-    compile on its own. Droplet's plan is to annotate each store trait with `#[async_trait]` from the
-    `async-trait` crate (digest pins `0.1.89`) so `Box<dyn ArtifactStore>` keeps working. Confirm the
-    dyn-vs-async rule against the pinned `async-trait` docs before you wire the real store traits in M2.
+  - verify: when these traits go **async** (Chunk 9, and for real starting with the `Source` connector
+    in M0/M2 and the store traits in M5–M8), native `async fn` in traits is stable but **not**
+    dyn-compatible, so a `Box<dyn ArtifactStore>` with an `async fn` method won't compile on its own.
+    Droplet's plan is to annotate each such trait with `#[async_trait]` from the `async-trait` crate
+    (digest pins `0.1.89`) so `Box<dyn ArtifactStore>` keeps working. Confirm the dyn-vs-async rule
+    against the pinned `async-trait` docs before you wire the real `Source` trait in M0.
 - [ ] Modules & visibility: move the registry/store types into `mod stores { ... }` and notice `main`
   can no longer reach them; then fix it by marking the types and methods `pub`.
   - 🆕 Concept: `mod` makes a namespace; items are *private by default*. `pub` exposes an item across
     the module boundary — this is how a crate chooses its public API and hides the rest. (Rust Book:
     Defining Modules to Control Scope and Privacy; Paths for Referring to an Item in the Module Tree)
-  - 🔗 Maps to: `droplet-core` keeps registry internals private and exposes only the store traits + the
-    flat tool surface as `pub`.
-  - ⚠️ Invariant (#7): the model-facing tool surface is **flat typed functions** (Monty has no class /
-    module namespacing) — so `droplet-core`'s public API stays a flat set of `pub` functions, not nested
-    modules the sandbox would have to navigate.
+  - 🔗 Maps to: `droplet-core` keeps registry internals private and exposes only the `Source`/store
+    traits + the flat tool surface as `pub`.
+  - ℹ️ Practical note (not a numbered invariant, but it shapes the design — see the README "Practical
+    note" under the Golden rules): the model-facing tool surface is **flat typed functions** (Monty is a
+    *subset* of Python — no classes / module namespacing) — so `droplet-core`'s public API stays a flat
+    set of `pub` functions, not nested modules the sandbox would have to navigate.
   - ✅ Done when: the build fails on a privacy error, then goes green once you add `pub`.
 
 ---
 
 ### Chunk 9 — Async/await, Tokio, `spawn_blocking`, and `Arc`
 
-> This is the second pillar of v1. Droplet's S3, DynamoDB, Redis, and SurrealDB clients are **all
-> async** (`.await`), while DuckDB is **synchronous and blocking**. You'll see the whole shape here:
-> run async code under Tokio, fence the blocking DuckDB-style call off with `spawn_blocking`, and share
-> one store across tasks with `Arc`.
+> This is the second pillar of v1. Droplet's connector IO, S3, DynamoDB, Redis, and SurrealDB clients
+> are **all async** (`.await`), while DuckDB (the *local* analyze engine) is **synchronous and
+> blocking**. You'll see the whole shape here: run async code under Tokio, fence the blocking
+> DuckDB-style call off with `spawn_blocking`, and share one store across tasks with `Arc`.
 
 - [ ] Read these five facts (no code yet), then do the exercises below:
   1. An `async fn` returns a **`Future`** — a lazy computation that does nothing until it's `.await`ed.
@@ -440,18 +459,20 @@ everything else maps onto things you already know.
      progress meanwhile. You can only `.await` inside an `async fn` or `async` block.
   3. Rust's std has no runtime to *drive* futures, so you bring one. **Tokio** is the de-facto runtime;
      `#[tokio::main]` turns `async fn main` into a normal `main` that starts the runtime.
-  4. **S3 (`aws-sdk-s3`), DynamoDB (`aws-sdk-dynamodb`), Redis (`redis`), and SurrealDB (`surrealdb`,
-     `Mem` engine) are all async** — every call ends in `.await`. That's why `droplet-core` owns a Tokio
+  4. **Connector IO (the `load` boundary), S3 (`aws-sdk-s3`), DynamoDB (`aws-sdk-dynamodb`), Redis
+     (`redis`), and SurrealDB (`surrealdb`, `Mem` engine) are all async** — every call ends in `.await`.
+     That's why `droplet-core` owns a Tokio runtime.
+  5. **DuckDB — the _local_ analyze engine that reads the Parquet `load` already pulled down — is the
+     opposite: synchronous, blocking CPU/IO work.** You must NOT run it on the async executor; you wrap
+     it in `tokio::task::spawn_blocking` so it runs on a separate thread pool and doesn't freeze the
      runtime.
-  5. **DuckDB is the opposite — synchronous, blocking CPU/IO work.** You must NOT run it on the async
-     executor; you wrap it in `tokio::task::spawn_blocking` so it runs on a separate thread pool and
-     doesn't freeze the runtime.
   - 🆕 Concept: the above is the whole mental model. Async/Tokio is beyond the Book, but the idea is
     "don't do blocking work on the async threads." (Rust Book: Fearless Concurrency — for the
     threads/`Send`/`Sync` background async builds on.)
   - ⚠️ Invariant (#5): the SurrealDB handle in fact #4 is **read-only and schema-derived** — built once
-    from the schema at session start, queried (never written) after that, and rebuilt on resume rather
-    than snapshotted.
+    from the schema at session start, queried (never written) after that, and **rebuilt** on resume
+    rather than snapshotted (snapshots are just REPL bytes + a manifest; engines are reconstructed, never
+    serialized).
 - [ ] Add Tokio to the scratch crate: `cargo add tokio --features rt-multi-thread,macros`.
   - 🆕 Concept: `--features` turns on optional parts of a crate. Tokio is modular: `macros` gives you
     `#[tokio::main]`, `rt-multi-thread` gives the multi-threaded runtime. (Rust Book: More About Cargo
@@ -465,8 +486,8 @@ everything else maps onto things you already know.
   `async fn greet(name: &str) -> String { format!("hi {name}") }`, then `let s = greet("droplet").await;`.
   - 🆕 Concept: calling an `async fn` *returns the future*; nothing runs until you `.await` it. (Async is
     beyond the Book — read the Tokio tutorial's "Hello Tokio" / "Async in depth" pages.)
-  - 🔗 Maps to: every store method in M2–M4 is an `async fn ... -> Result<_, DropletError>` you'll
-    `.await`. This is the exact call shape.
+  - 🔗 Maps to: every connector method (`Source`, M0/M2) and every store method (M5–M8) is an
+    `async fn ... -> Result<_, DropletError>` you'll `.await`. This is the exact call shape.
   - ✅ Done when: `s == "hi droplet"`.
 - [ ] Fence off a **blocking** call with `spawn_blocking`: simulate DuckDB's sync work and double-`?`
   the result:
@@ -484,12 +505,15 @@ everything else maps onto things you already know.
     (did the task panic?). When the closure *also* returns a `Result`, you write `.await??` — the first
     `?` unwraps the `JoinError`, the second the inner result. (Async is beyond the Book; see the Tokio
     docs for `spawn_blocking`.)
-  - 🔗 Maps to: this is *exactly* how Droplet runs DuckDB — `run_sql` connects + queries + collects
-    Arrow inside `spawn_blocking(...)`, then `.await??`s it. The closure is `move` and must own its data
-    (a DuckDB `Connection` is created and owned *inside* the closure, never shared across threads).
-  - ⚠️ Invariant (#6): DuckDB is synchronous → run it inside `spawn_blocking`, never on the async
+  - 🔗 Maps to: this is *exactly* how Droplet runs its **local** DuckDB analyze engine (M1) — each
+    analyze primitive (`local_sql`, `group_agg`, `to_rows`, …) connects + queries the **downloaded
+    Parquet** + collects Arrow inside `spawn_blocking(...)`, then `.await??`s it. (Remember: DuckDB never
+    touches a source — it only crunches the local copy `load` already pulled down.) The closure is `move`
+    and must own its data (a DuckDB `Connection` is created and owned *inside* the closure, never shared
+    across threads).
+  - ⚠️ Invariant (#9): DuckDB is synchronous → run it inside `spawn_blocking`, never on the async
     executor; and (in the PyO3 layer in `droplet-py`, much later) release the GIL during query
-    execution. NOTE invariant (#1): the GIL-release step lives **only** in `droplet-py` —
+    execution. NOTE invariant (#8): the GIL-release step lives **only** in `droplet-py` —
     `droplet-core` never imports `pyo3`, so the warm-up and `droplet-core` itself stay pure Rust.
   - ✅ Done when: `n == 42` and you can explain why the closure must be `move`.
 - [ ] Share one value across two tasks with `Arc`: wrap a value in
@@ -513,7 +537,7 @@ everything else maps onto things you already know.
   - 🔗 Maps to: the in-memory dev `CoordinationStore` (run registry, leases, cache index) is an
     `Arc<Mutex<HashMap<...>>>` so concurrent tasks coordinate safely; the prod backends (Redis/DynamoDB)
     do this server-side instead.
-  - ⚠️ Invariant (#8): mutable coordination (registry, leases, cache index) lives in the consistent
+  - ⚠️ Invariant (#7): mutable coordination (registry, leases, cache index) lives in the consistent
     store; the in-memory dev version uses a `Mutex` to stand in for that consistency.
   - ✅ Done when: after both tasks finish, the counter reads `2`.
 
@@ -528,10 +552,10 @@ everything else maps onto things you already know.
 - [ ] Read the one idea, then build it: *content-addressing* means you don't pick a name for a blob —
   you **hash its bytes** and use that fixed-length digest as the key. Identical inputs always produce
   the identical key, so you can ask "do we already have this?" without re-reading or re-computing it.
-  - 🔗 Maps to: PRODUCT.md §5 — the ArtifactStore (materialized Parquet) and SnapshotStore (REPL +
+  - 🔗 Maps to: PRODUCT.md §11–§13 — the ArtifactStore (materialized Parquet) and SnapshotStore (REPL +
     manifest blobs) are *both* immutable and content-addressed; the CoordinationStore's cache index maps
-    `cache_key → artifact_key`, where the cache key is `hash(normalized_query + source + freshness_token)`.
-  - ⚠️ Invariant (#8): immutable data is content-addressed in the object store; mutable coordination is
+    `cache_key → artifact_key`, where the cache key is `hash(scoped query + source + freshness_token)`.
+  - ⚠️ Invariant (#7): immutable data is content-addressed in the object store; mutable coordination is
     in the consistent store.
 - [ ] Add the hash crate: `cargo add blake3@1`.
   - 🆕 Concept: BLAKE3 is a fast cryptographic hash. Droplet uses **`blake3` (1.x)** rather than `sha2`
@@ -548,8 +572,9 @@ everything else maps onto things you already know.
     a `Hash`, and `.to_hex().to_string()` gives you an owned `String` key for a `HashMap`/object-store
     key. (`Hash::to_hex` returns a `blake3::Hex`, an `ArrayString`, **not** a `String` — so call
     `.to_string()`.)
-  - 🔗 Maps to: this *single* helper is what M2 and M7 use for **both** the artifact cache key and the
-    content-addressed snapshot key — same bytes, same key, automatic dedup across pods.
+  - 🔗 Maps to: this *single* helper is what the content-addressed cache (M5) and the snapshot store
+    (M8) use for **both** the artifact cache key and the content-addressed snapshot key — same bytes,
+    same key, automatic dedup across pods.
   - ✅ Done when: `cargo build` is green with `artifact_key` defined.
 - [ ] Test that it's deterministic and collision-sensitive:
     ```rust
@@ -568,36 +593,40 @@ everything else maps onto things you already know.
 
 Tick these off honestly. If one isn't true, revisit the chunk that taught it.
 
-- [ ] Run `rustc --version` and see **≥ 1.85.0**, and have `cargo fmt` and `cargo clippy` both work.
-  *(Chunk 1 — Droplet's `rust-toolchain.toml` pins `1.96.0` + `rustfmt` + `clippy`.)*
+- [ ] Run `rustc --version` and see a recent stable (**≥ 1.89** is the safe floor once M0's maturin
+  lands), and have `cargo fmt` and `cargo clippy` both work. *(Chunk 1 — M0's `rust-toolchain.toml` pins
+  one exact version + `rustfmt` + `clippy`.)*
 - [ ] Explain in one sentence the difference between a `--lib` and a `--bin` crate. *(`droplet-core` is a
   lib; `xtask` is a bin.)*
 - [ ] Explain **move vs borrow vs clone**, and predict whether a given signature
   (`fn f(x: T)` vs `fn f(x: &T)` vs `fn f(x: &mut T)`) consumes, reads, or mutates its argument.
   *(The one that unblocks everything — Chunk 3.)*
 - [ ] Define a `struct` with an `impl` block that has a `&mut self` method, and a `#[test]` that drives
-  it. *(That's the `Session` shape — Chunk 4; invariant #9.)*
+  it. *(That's the `Session` shape — Chunk 4; invariant #3 — one local, ephemeral run.)*
 - [ ] Write a `match` over an `enum` with data and have the compiler catch a missing variant. *(That's
-  the Monty `ReplProgress` driver loop — Chunk 4; invariant #7.)*
+  the Monty `ReplProgress` driver loop — Chunk 4; M3.)*
 - [ ] Use `Option` with the `?` operator. *(That's a cache-index miss returning `None`.)*
 - [ ] Use `Result` with the `?` operator, and define a `thiserror` error enum with a `#[from]` variant.
   *(That's `DropletError` — invariant #10.)*
 - [ ] Build a `HashMap<u64, _>` registry that hands out incrementing `u64` ids and looks values back up.
-  *(That's the handle registry — invariants #4 and #8.)*
+  *(That's the handle registry — invariants #6 and #7.)*
 - [ ] **Define a trait, implement it for two backends, take it by generic, and store mixed backends in a
-  `Vec<Box<dyn Trait>>`.** *(That's the four store seams — `Source`, `ArtifactStore`, `SnapshotStore`,
-  `CoordinationStore` — invariant #8. Remember: the real traits are async, so they'll need
+  `Vec<Box<dyn Trait>>`.** *(That's the `Source` connector trait (M0) plus the three store traits —
+  `ArtifactStore` (M5), `CoordinationStore` (M7), `SnapshotStore` (M8) — invariant #7. They're built
+  across M0 and M5–M8, not all at once in M0. Remember: the real traits are async, so they'll need
   `#[async_trait]` to stay `dyn`-compatible.)*
 - [ ] Mark items `pub` to expose them across a `mod` boundary, and keep internals private. *(That's how
-  `droplet-core` exposes only its store traits + flat tool surface — invariant #7.)*
+  `droplet-core` exposes only its `Source`/store traits + flat tool surface — see the README "Practical
+  note": Monty is a Python *subset*, so the surface is flat typed functions.)*
 - [ ] **Run an `async fn` under `#[tokio::main]`, `.await` it, fence a blocking call with
   `spawn_blocking(...).await??`, and share one value across tasks with `Arc` (plus a `Mutex` for shared
-  mutation).** *(That's the S3/Redis/DynamoDB/Surreal async story + DuckDB's `spawn_blocking` —
-  invariants #5, #6, #8.)*
+  mutation).** *(That's the connector/S3/Redis/DynamoDB/Surreal async story + the local DuckDB engine's
+  `spawn_blocking` — invariants #5, #9, #7.)*
 - [ ] **Hash some bytes with `blake3` into a hex key and explain why "same bytes → same key" means the
-  cache and snapshots dedupe across pods.** *(That's content-addressing — invariant #8; Chunk 10.)*
+  cache and snapshots dedupe across pods.** *(That's content-addressing — invariant #7; Chunk 10.)*
 
 > When every box above is ticked, drop `droplet-warmup` from the workspace `members` (M0 tells you
-> exactly where) and open [`M0-skeleton.md`](./M0-skeleton.md). You'll rebuild the handle registry,
-> `DropletError`, the `Session`, and the four store traits **for real** — but now they'll feel familiar
-> instead of foreign.
+> exactly where) and open [`M0-skeleton.md`](./M0-skeleton.md). M0 builds the handle registry,
+> `DropletError`, the `Session`, and the **`Source` connector trait** (with a trivial local-Parquet dev
+> connector) **for real** — and the three store traits (`ArtifactStore`, `CoordinationStore`,
+> `SnapshotStore`) arrive later in M5–M8 — but now they'll all feel familiar instead of foreign.

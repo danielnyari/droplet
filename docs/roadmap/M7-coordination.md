@@ -1,36 +1,36 @@
-# M3 — CoordinationStore: Redis then DynamoDB (SKETCH)
+# M7 — CoordinationStore: Redis then DynamoDB (SKETCH)
 
 **Milestone goal:** implement the `CoordinationStore` trait against a real backend — **Redis first**, then a
 second **DynamoDB** impl — so the run registry, the leases, and the cache index live in a strongly
 consistent store that every pod shares.
 
-**Done when (from the spec, build order step 4):** the `CoordinationStore` trait has a working Redis impl
+**Done when (from the spec, build order step 6):** the `CoordinationStore` trait has a working Redis impl
 *and* a working DynamoDB impl, each providing the run registry (`run_id` → snapshot pointer + status),
 leases (one active worker per run, short TTL, reassignable on expiry), and the cache index
 (`cache_key` → `artifact_key`) — and both pass the same trait-level tests the in-memory dev impl passes.
 
-**Prerequisite:** finish [`M2-artifact-cache.md`](./M2-artifact-cache.md) (build-order step 3). You need the
+**Prerequisite:** finish [`M5-artifact-cache.md`](./M5-artifact-cache.md) (build-order step 5). You need the
 `CoordinationStore` trait *shape*, the in-memory dev impl, the `cache_key` / `artifact_key` notions, and
-`DropletError` already in place — M2 already writes the cache index *through* this trait, so M3 is "swap in
+`DropletError` already in place — M5 already writes the cache index *through* this trait, so M7 is "swap in
 a real backend." (The trait itself and the four store-trait skeletons come from
 [`M0-skeleton.md`](./M0-skeleton.md), build-order step 1.)
 
 **Estimate:** ~10 chunks.
 
 > This is a **SKETCH** file: chunk-level checkboxes with concept notes and invariant callouts, *not* the
-> tiny per-line steps of M0/M1. Get the shape right first; expand into tiny steps when you reach this
+> tiny per-line steps of M0/M1/M2. Get the shape right first; expand into tiny steps when you reach this
 > milestone.
 
 ---
 
-> 🧭 **What M3 is really about (read first, 5 min).** M0 gave you the four store *traits* and dev-only
-> in-memory impls. M2 used the `ArtifactStore` for real (S3) and started writing the cache index through
-> `CoordinationStore`. **M3 makes `CoordinationStore` real.** It is the one store that holds *mutable*,
+> 🧭 **What M7 is really about (read first, 5 min).** M0 gave you the four store *traits* and dev-only
+> in-memory impls. M5 used the `ArtifactStore` for real (S3) and started writing the **cache index** through
+> `CoordinationStore`. **M7 makes `CoordinationStore` real.** It is the one store that holds *mutable*,
 > *coordinated* state — the registry, the leases, the cache index — so it must be **strongly consistent**
-> (invariant #8). You build it **twice**, behind one trait, so a deployment can pick Redis *or* DynamoDB.
+> (invariant #7). You build it **twice**, behind one trait, so a deployment can pick Redis *or* DynamoDB.
 >
 > 🆕 **Concept: the same trait, two impls.** A `trait` in Rust is a contract. You already have
-> `CoordinationStore` (defined in M0) and an in-memory impl. M3 adds `RedisCoordinationStore` and
+> `CoordinationStore` (defined in M0) and an in-memory impl. M7 adds `RedisCoordinationStore` and
 > `DynamoCoordinationStore` — both `impl CoordinationStore for …`. Code that holds a
 > `Box<dyn CoordinationStore>` never knows or cares which one it got. (Rust Book: *Generic Types, Traits,
 > and Lifetimes*, ch. 10; and *Object-Oriented Programming Features of Rust*, ch. 18 — trait objects.)
@@ -41,6 +41,15 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 > affinity — any pod may win it next time. (No Rust Book chapter — this is a design idea, not a language
 > feature.)
 >
+> 🆕 **Concept: the cache index is one of the three coordinated jobs.** It is *not* an afterthought bolted
+> onto the registry — `PRODUCT.md` §11 names it as the third piece of `CoordinationStore` alongside the
+> registry and the leases. M5 already computes the content-address `cache_key = hash(scoped query + source +
+> freshness token)` and writes `cache_key → artifact_key` through this trait; the artifact bytes live in S3
+> (`ArtifactStore`), but the *pointer* that lets the whole fleet agree "this exact scoped load is already in
+> S3 at *that* key" must live in the **consistent** store, so a second pod's `load` sees the first pod's
+> download instead of re-pulling the source. That fleet-wide reuse is the entire payoff of caching.
+> (No Rust Book chapter — design idea.)
+>
 > 🆕 **Concept: `#[async_trait]` is still required here.** `CoordinationStore`'s methods are `async` *and*
 > the store is used as `Box<dyn CoordinationStore>` (pluggable backend). Native `async fn` in traits is
 > stable in modern Rust but is **not** dyn-compatible, so any trait you call behind a `dyn` pointer must be
@@ -49,25 +58,27 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 > already added `async-trait` to `[workspace.dependencies]`. (No Rust Book chapter — this is a crate-level
 > mechanism; *Object-Oriented Programming Features of Rust*, ch. 18 covers the `dyn` side.)
 >
-> 🔗 **Maps to:** invariant #8 ("mutable coordination — registry, leases, cache index — is in the consistent
-> store; resume is lease-guarded; no affinity"). The lease you build here is exactly what M7's cross-pod
-> `Session.resume(run_id)` will hold before it touches a run.
+> 🔗 **Maps to:** invariant #7 ("mutable coordination — registry, leases, cache index — is in the consistent
+> store; resume is lease-guarded; no affinity"). The lease you build here is exactly what M8's cross-pod
+> `Session.resume(run_id)` will hold before it touches a run; the cache index you build here is exactly what
+> M5's `load` reads to skip a re-download fleet-wide.
 
 ---
 
 ### Chunk 1 — Re-read the `CoordinationStore` trait and pin the operations
 
-- [ ] Open the `CoordinationStore` trait you defined in M0 and write down the exact method set M3 must
+- [ ] Open the `CoordinationStore` trait you defined in M0 and write down the exact method set M7 must
   satisfy, grouped by the three jobs from the spec:
   - **Run registry:** `put_run` / `get_run` (or set-status / read-snapshot-pointer) — `run_id` →
     `{ status, snapshot_pointer }`.
   - **Leases:** `acquire_lease`, `renew_lease`, `release_lease` — one active worker per run, short TTL,
     reassignable on expiry.
-  - **Cache index:** `cache_index_get` / `cache_index_put` — `cache_key` → `artifact_key` (M2 already
+  - **Cache index:** `cache_index_get` / `cache_index_put` — `cache_key` → `artifact_key` (M5 already
     calls these).
-  - ⚠️ Invariant #8: *"mutable coordination (registry, leases, cache index) is in the **consistent
+  - ⚠️ Invariant #7: *"mutable coordination (run registry, leases, cache index) is in the **consistent
     store**."* These three jobs are the *whole* reason `CoordinationStore` exists — keep them together
-    behind one trait.
+    behind one trait. (Immutable parquet bytes live in S3 via `ArtifactStore`; the *index pointing at*
+    those bytes is mutable coordination and belongs here.)
   - ⚠️ Invariant #10: the trait's methods return `Result<_, DropletError>`. Both backends will fold their
     native errors into `DropletError`; do that at the impl boundary, never leak `redis::RedisError` or an
     AWS `SdkError` past the trait.
@@ -80,8 +91,9 @@ a real backend." (The trait itself and the four store-trait skeletons come from
   - 🆕 Concept: an **owner check (fencing).** Renew and release must verify *you still own* the lease
     before mutating it, so you never stomp a lease that already expired and was re-acquired by another pod.
     Carry `worker_id` for exactly this. (No Rust Book chapter — design rule, not syntax.)
-  - ⚠️ Invariant #9: the lease is per-run — one run is one isolated `Session` on one pod at a time. The
-    `worker_id` + per-run key is what enforces "one active worker per run" across the fleet.
+  - ⚠️ Invariant #7: the lease is per-run — one run is one isolated `Session` resumed on one pod at a time.
+    The `worker_id` + per-run key is what enforces "one active worker per run" across the fleet, with **no
+    affinity** (any pod may hold it next).
   - ✅ Done when: the trait's lease methods take a `worker_id` and a TTL, and you've noted "release / renew
     are owner-checked."
 
@@ -89,7 +101,7 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 
 - [ ] Run a local Redis with Docker so you have something to hit:
   `docker run --name droplet-redis -p 6379:6379 -d redis:8`. Confirm it answers.
-  - 🆕 Concept: **local dev backend.** Just like M2 used MinIO to stand in for S3, you use a local Redis
+  - 🆕 Concept: **local dev backend.** Just like M5 used MinIO to stand in for S3, you use a local Redis
     container to stand in for a managed Redis. No code change — only the connection URL differs. (No Rust
     Book chapter — local dev infra.)
   - ⚠️ verify: the image tag. `redis:8` was current as of mid-2026; if it 404s, use `redis:latest`. Keep
@@ -102,14 +114,14 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 
 - [ ] Add the dependency to the crate that owns the Redis impl (`droplet-core`):
   `redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }`. (`tokio` is already a
-  workspace dep from M1/M2.)
+  workspace dep from M1/M5.)
   - 🆕 Concept: **Cargo features are mandatory here.** With *no* features, `redis` is sync-only.
     `tokio-comp` enables async on the Tokio runtime; `connection-manager` enables `ConnectionManager`
     (auto-reconnect). The `aio` async-core module comes in transitively via `tokio-comp`. (Rust Book:
     *More About Cargo and Crates.io*, ch. 14 — feature flags.)
   - ⚠️ verify: `redis` recently jumped from the long `0.2x` line to **1.x** (latest `1.2.3`, edition 2024,
     MSRV Rust 1.88). Any tutorial pinning `redis = "0.25"` is stale — pin `redis = "1"` (or `"1.2"`).
-    Edition 2024 / Rust 1.88 aligns with the workspace toolchain (M0 pins `1.96.0`).
+    Edition 2024 / Rust 1.88 aligns with the workspace toolchain (M0 pins the exact toolchain).
   - ✅ Done when: `cargo build -p droplet-core` succeeds with `redis` added.
 - [ ] Write a `connect()` helper: `redis::Client::open("redis://127.0.0.1:6379/")?` then
   `ConnectionManager::new(client).await?`. Store **one** `ConnectionManager` on your
@@ -118,23 +130,30 @@ a real backend." (The trait itself and the four store-trait skeletons come from
     concurrent commands over one socket; `ConnectionManager` wraps that *and* adds auto-reconnect.
     `clone()` is cheap and shares the same underlying connection — that's the intended pattern. (Rust Book:
     *Smart Pointers*, ch. 15 / *Fearless Concurrency*, ch. 16 — cheap shared handles.)
-  - ✅ Done when: a `#[tokio::test]` connects, does `con.set("ping", "1").await?` then
+  - ✅ Done when: a `#[tokio::test]` connects, does `let _: () = con.set("ping", "1").await?;` then
     `let v: Option<String> = con.get("ping").await?;`, and asserts `v == Some("1".into())`. (Remember
-    `use redis::AsyncCommands;` or the methods won't exist — a classic beginner trap.)
+    `use redis::AsyncCommands;` or the methods won't exist — a classic beginner trap.) Under the generic
+    `AsyncCommands` trait, `set` returns a generic `RV`, so a `set` whose result you ignore still needs an
+    `RV` annotation such as `: ()` — otherwise the compiler says "type annotations needed." (Chunk 5 needs
+    this same generic `AsyncCommands` so its `set_options(...) : bool` decode works.)
 
 ### Chunk 4 — Redis: run registry + cache index (the easy two)
 
 - [ ] Implement the **cache index** with one Redis hash:
   `hset("droplet:cache_index", cache_key, artifact_key)` to write, `hget(...) -> Option<String>` to look
-  up (`None` = cache miss). This backs M2's `cache_key → artifact_key` lookups.
+  up (`None` = cache miss). This backs M5's `cache_key → artifact_key` lookups, so any pod's `load` can
+  discover that another pod already unloaded this exact scoped slice to S3.
   - 🆕 Concept: **HSET/HGET vs SET/GET.** `SET`/`GET` work on a whole key holding one string (good for a
     lease key). `HSET`/`HGET` store many `field → value` pairs under **one** key (a hash) — so the cache
     index is *one* Redis key, not thousands of top-level keys. (No Rust Book chapter — Redis data model.)
+  - ⚠️ Invariant #7: the index entry is mutable coordination, so it lives here in the consistent store; the
+    parquet bytes it points at are immutable and content-addressed in S3 (`ArtifactStore`, M5). Pointer here,
+    bytes there — that split *is* the distributed-state-plane design.
   - ✅ Done when: a test `put`s a `cache_key → artifact_key`, then `get`s it back, and a missing key
     returns `None`.
 - [ ] Implement the **run registry** as a per-run hash `droplet:run:{run_id}` with fields `status` and
   `snapshot` via `hset_multiple`; read back with `hget` / `hgetall`.
-  - ⚠️ Invariant #8: the registry is the canonical "where is run R and what's its latest snapshot pointer"
+  - ⚠️ Invariant #7: the registry is the canonical "where is run R and what's its latest snapshot pointer"
     record — it must live in the consistent store, not on any single pod's disk. This is what lets *any*
     pod answer "resume run R."
   - ✅ Done when: a test sets `status = running`, `snapshot = snap:v1` for a `run_id`, reads both back, and
@@ -152,7 +171,7 @@ a real backend." (The trait itself and the four store-trait skeletons come from
     a crashed owner's lease auto-frees and another pod can take over. `NX` without expiry leaks the lock on
     crash; expiry without `NX` doesn't guarantee a single owner — you need **both**. (No Rust Book chapter
     — design idea.)
-  - ⚠️ Invariant #8: *"leases (one active worker per run; short TTL; reassignable — **not affinity**)."*
+  - ⚠️ Invariant #7: *"leases (one active worker per run; short TTL; reassignable — **not affinity**)."*
     Reassignable-on-expiry is the whole point: there is **no** session affinity, so the next holder may be
     a different pod.
   - ⚠️ verify: the `bool` decoding on `redis` 1.2.x. `set_options` is generic over the return type; the
@@ -173,7 +192,9 @@ a real backend." (The trait itself and the four store-trait skeletons come from
   - ⚠️ verify: the `redis` 1.2.x script / `EVAL` API (e.g.
     `redis::Script::new(src).key(k).arg(v).invoke_async`) against `docs.rs` before writing it — only
     `acquire` needs `SET NX PX`; release / renew need the script form (renew should also be owner-checked:
-    only re-set the TTL if the value is still our `worker_id`).
+    only re-set the TTL if the value is still our `worker_id`). Note: `redis::Script` lives behind the
+    default `script` feature — fine as long as you don't pass `default-features = false` (the Chunk 3
+    dependency line doesn't); if you ever do, re-add `"script"` explicitly.
   - ✅ Done when: a test where worker-A holds the lease and worker-B calls `release_lease` (wrong owner)
     leaves the lease **intact**; worker-A's `release_lease` frees it.
 
@@ -187,13 +208,13 @@ a real backend." (The trait itself and the four store-trait skeletons come from
     binaries; all engine errors fold into `DropletError`."*
   - ⚠️ Don't forget the `#[async_trait]` attribute on the `impl` block (see the concept note up top):
     without it, `Box<dyn CoordinationStore>` won't compile against an `async fn` trait.
-  - ✅ Done when: the same trait-level test you wrote for the in-memory dev impl in M0/M2 (registry
+  - ✅ Done when: the same trait-level test you wrote for the in-memory dev impl in M0/M5 (registry
     round-trip, cache-index round-trip, lease single-winner) passes against `RedisCoordinationStore`, and a
     deliberately broken command surfaces as a `DropletError`, not a raw `redis::RedisError`.
 - [ ] Confirm the dev path still works *without* Redis: tests over the in-memory impl run with no
-  container. Keep both impls behind `Box<dyn CoordinationStore>` so callers (M7's resume) never branch on
-  backend.
-  - ⚠️ Invariant #8: production uses the consistent store; the in-memory impl is dev-only and is **not**
+  container. Keep both impls behind `Box<dyn CoordinationStore>` so callers (M8's resume, M5's `load`)
+  never branch on backend.
+  - ⚠️ Invariant #7: production uses the consistent store; the in-memory impl is dev-only and is **not**
     safe across pods — say so in a doc comment so nobody ships it.
   - ✅ Done when: `cargo test` is green with the Redis container *down* (in-memory tests) and *up* (Redis
     tests).
@@ -202,7 +223,7 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 
 - [ ] Run **DynamoDB Local** with Docker on port 8000:
   `docker run --name droplet-ddb -p 8000:8000 -d amazon/dynamodb-local`. By hand (or via
-  `aws --endpoint-url http://localhost:8000`), create the tables M3 needs — e.g. `droplet_leases`,
+  `aws --endpoint-url http://localhost:8000`), create the tables M7 needs — e.g. `droplet_leases`,
   `droplet_runs`, `droplet_cache_index`, each with a string partition key `pk`.
   - 🆕 Concept: **local dev backend, again.** DynamoDB Local is the AWS equivalent of MinIO — a container
     that speaks the real DynamoDB API so you don't need a cloud account to develop. You point the SDK at
@@ -214,7 +235,9 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 
 ### Chunk 8 — Add the AWS SDK and a shared config + DynamoDB client
 
-- [ ] Add the deps with exact pins (these AWS crates publish ~weekly — re-check before pinning):
+- [ ] **verify:** these AWS crates publish ~weekly, so re-check before pinning — `aws-config = 1.8.18` /
+  `aws-sdk-dynamodb = 1.116.0` were current 2026-06-15, not on the approved PINS list, and rest entirely on
+  this note; don't copy the numbers as gospel. Add the deps:
   `aws-config = { version = "1.8.18", features = ["behavior-version-latest"] }`,
   `aws-sdk-dynamodb = "1.116.0"`, and ensure `tokio` has enough features (`["full"]` is simplest here).
   - 🆕 Concept: **`BehaviorVersion` is a required knob.** `aws_config::defaults(BehaviorVersion::latest())`
@@ -223,14 +246,15 @@ a real backend." (The trait itself and the four store-trait skeletons come from
     first-hour trap. (Rust Book: *More About Cargo and Crates.io*, ch. 14 — features.)
   - ⚠️ verify: `aws-config = 1.8.18` / `aws-sdk-dynamodb = 1.116.0` were current 2026-06-15. Pin exact and
     let `Cargo.lock` hold them; re-check before bumping. Do **not** mix a `0.x` `aws-config` with a `1.x`
-    SDK — the whole `1.x` line shares `aws-smithy-*` internals.
+    SDK — the whole `1.x` line shares `aws-smithy-*` internals. (M6 already added `aws-config` + S3/Athena
+    SDKs for the connectors; reuse the same `aws-config` pin here for the DynamoDB SDK.)
   - ✅ Done when: `cargo build -p droplet-core` succeeds with the AWS deps added.
 - [ ] Build the shared config once and a DynamoDB-Local client from it:
   `let shared = aws_config::defaults(BehaviorVersion::latest()).region("us-east-1").load().await;` then a
   ddb-specific config via `aws_sdk_dynamodb::config::Builder::from(&shared).endpoint_url("http://localhost:8000").build()`
   → `Client::from_conf(...)`. (Real AWS: just `aws_sdk_dynamodb::Client::new(&shared)`.)
   - 🆕 Concept: **every AWS call ends in `.send().await`.** The SDK is fully async over Tokio. Keep this
-    code *off* the DuckDB thread — DuckDB stays sync behind `spawn_blocking` (invariant #6); coordination
+    code *off* the DuckDB thread — DuckDB stays sync behind `spawn_blocking` (invariant #9); coordination
     is async. (No Rust Book chapter — SDK design.)
   - ⚠️ verify: `endpoint_url` for DynamoDB Local goes on the **service** config builder (or env
     `AWS_ENDPOINT_URL_DYNAMODB`), not on `aws-config`'s loader — so S3 (MinIO, 9000) and DynamoDB (8000)
@@ -247,6 +271,8 @@ a real backend." (The trait itself and the four store-trait skeletons come from
   - 🆕 Concept: **`AttributeValue` is an enum, and numbers are strings on the wire.** `::S(String)` for
     text, `::N(String)` for numbers (yes, the *number* is a `String`), `::B` binary, `::Bool`, `::M` map,
     `::L` list. (Rust Book: *Enums and Pattern Matching*, ch. 6.)
+  - ⚠️ Invariant #7: the cache-index item behaves identically to the Redis hash — same `cache_key →
+    artifact_key` semantics, same consistent-store guarantee, so M5's `load` reuse is backend-agnostic.
   - ✅ Done when: registry and cache-index round-trips pass against DynamoDB Local, matching the Redis
     impl's behavior.
 - [ ] Implement `acquire_lease` as a conditional write: `put_item` with item `pk = "lease#{run_id}"`,
@@ -262,7 +288,7 @@ a real backend." (The trait itself and the four store-trait skeletons come from
     call `err.as_service_error()` then `.is_conditional_check_failed_exception()` to recognize contention
     vs a real transport error. Match the right op's error type (`PutItemError` for put, `UpdateItemError`
     for update). (No Rust Book chapter — SDK error model.)
-  - ⚠️ Invariant #8: same lease semantics as Redis — one active worker, reassignable on expiry, **not**
+  - ⚠️ Invariant #7: same lease semantics as Redis — one active worker, reassignable on expiry, **not**
     affinity. The two backends must behave identically behind the trait.
   - ⚠️ verify: DynamoDB **TTL is a background sweeper**, not precise expiry — deletes lag up to ~48h, and
     DynamoDB Local may not sweep at all. So the `ttl` attribute is only garbage-collection. **Lease
@@ -276,8 +302,8 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 - [ ] Implement `renew_lease` / `release_lease` with `update_item` / `delete_item`, guarded by a condition
   that `owner = worker_id` (the owner / fencing check). Use the `UpdateItemError` / `DeleteItemError`
   service-error helpers the same way as the put.
-  - ⚠️ Invariant #9: the owner-guarded release is what keeps one run's lease from being torn down by a
-    worker that no longer owns the run — per-run isolation across the fleet.
+  - ⚠️ Invariant #7: the owner-guarded release is what keeps one run's lease from being torn down by a
+    worker that no longer owns the run — per-run isolation across the fleet, with no affinity.
   - ✅ Done when: a wrong-owner `release_lease` is rejected; the true owner's release frees the lease.
 
 ### Chunk 10 — DynamoDB: fold errors, finish the trait, run both backends through the same tests
@@ -289,7 +315,7 @@ a real backend." (The trait itself and the four store-trait skeletons come from
   - ⚠️ Invariant #10: same rule as the Redis impl — no raw `SdkError` leaks past the trait; everything is
     `DropletError`.
   - ⚠️ Keep the **conflict** case mapped to a *distinct* `DropletError` variant the caller can recognize as
-    "lease taken," apart from a generic transport failure — M7's resume needs to tell "another pod owns
+    "lease taken," apart from a generic transport failure — M8's resume needs to tell "another pod owns
     this run" from "Dynamo is unreachable."
   - ✅ Done when: a deliberately bad call surfaces as a `DropletError`, and the conflict case maps to a
     distinct `DropletError` variant the caller can recognize as "lease taken."
@@ -299,8 +325,8 @@ a real backend." (The trait itself and the four store-trait skeletons come from
   - 🆕 Concept: **trait-level conformance tests.** Write the test against the *trait*, then run it once per
     backend. This is how you guarantee Redis and DynamoDB are truly interchangeable — and it's the safety
     net for swapping backends later. (Rust Book: *Writing Automated Tests*, ch. 11.)
-  - ⚠️ Invariant #8: this conformance is what the spec's "Redis **or** DynamoDB" promise rests on — a
-    deployment picks one, and the rest of Droplet (M7 resume especially) is none the wiser.
+  - ⚠️ Invariant #7: this conformance is what the spec's "Redis **or** DynamoDB" promise rests on — a
+    deployment picks one, and the rest of Droplet (M8 resume, M5 cache reuse) is none the wiser.
   - ✅ Done when: the same lease / registry / cache-index suite is green against in-memory, Redis
     (container up), and DynamoDB Local (container up).
 
@@ -308,13 +334,17 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 
 ## Notes carried forward (don't act yet)
 
-- **The lease is for M7's resume.** Nothing in M3 *uses* the lease yet — `Session.resume(run_id)` in
-  [`M7-snapshot-store.md`](./M7-snapshot-store.md) is the first caller. There, a pod must
+- **The lease is for M8's resume.** Nothing in M7 *uses* the lease yet — `Session.resume(run_id)` in
+  [`M8-snapshot-resume.md`](./M8-snapshot-resume.md) is the first caller. There, a pod must
   `acquire_lease(run_id)` **before** rebuilding DuckDB from the manifest, `renew_lease` while running, and
-  `release_lease` at the end. M3 just has to make the lease *correct and identical across backends*.
-  (Invariant #8: "resume is lease-guarded.")
-- **The registry holds the snapshot pointer M7 writes.** The `snapshot` field you set in the registry here
-  is where M7's `SnapshotStore` content-addressed blob key lands, so any pod can find a run's latest
+  `release_lease` at the end. M7 just has to make the lease *correct and identical across backends*.
+  (Invariant #7: "resume is lease-guarded.")
+- **The cache index is for M5's `load`.** M5 already writes `cache_key → artifact_key` through this trait;
+  once a real backend exists, a second pod's `load` reads the index, finds the hit, and re-attaches the
+  cached parquet from S3 instead of re-unloading the source. Keep the `cache_key` / `artifact_key` field
+  names stable so M5's reads match M7's writes. (Invariant #7 + PRODUCT.md §11.)
+- **The registry holds the snapshot pointer M8 writes.** The `snapshot` field you set in the registry here
+  is where M8's `SnapshotStore` content-addressed blob key lands, so any pod can find a run's latest
   snapshot. Keep the field name stable.
 - **TTL is GC, not a lock timeout — in *both* backends.** Redis `PX` auto-frees a key precisely; DynamoDB
   TTL is a lazy sweeper (~48h, none locally). Lease correctness must come from atomic acquire
@@ -332,4 +362,4 @@ a real backend." (The trait itself and the four store-trait skeletons come from
 
 ---
 
-> 📌 When you reach this milestone, expand each chunk into tiny steps the way M0/M1 are written.
+> 📌 When you reach this milestone, expand each chunk into tiny steps the way M0/M1/M2 are written.
