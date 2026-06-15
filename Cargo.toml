@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/droplet-core"]
+members = ["crates/droplet-core", "crates/droplet-py"]
 
 [workspace.package]
 edition    = "2024"
@@ -13,3 +13,8 @@ thiserror   = "2.0.18"
 serde       = { version = "1.0.228", features = ["derive"] }
 async-trait = "0.1.89"
 tokio       = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+# NOTE: the `extension-module` feature is deprecated (it disables libpython
+# linking and breaks `cargo test`/workspace builds). maturin >= 1.9.4 builds the
+# extension module itself (via PYO3_BUILD_EXTENSION_MODULE), so plain cargo can
+# link libpython normally.
+pyo3        = { version = "0.29", features = ["abi3-py310"] }

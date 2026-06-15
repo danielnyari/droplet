@@ -1,0 +1,13 @@
+[package]
+name = "droplet-py"
+edition.workspace    = true
+version.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+name       = "_droplet"        # compiled module name -> imported as droplet._droplet
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3.workspace = true
