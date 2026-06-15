@@ -1,10 +1,15 @@
-
 [workspace]
-resolver = "3"                
-members = ["crates/droplet-core", "droplet-warmup"]
+resolver = "3"
+members = ["crates/droplet-core"]
 
-[workspace.package]            
-edition = "2024"
-version = "0.0.1"
-license = "MIT"
+[workspace.package]
+edition    = "2024"
+version    = "0.0.1"
+license    = "MIT"
 repository = "https://github.com/you/droplet"
+
+[workspace.dependencies]
+thiserror   = "2.0.18"
+serde       = { version = "1.0.228", features = ["derive"] }
+async-trait = "0.1.89"
+tokio       = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
