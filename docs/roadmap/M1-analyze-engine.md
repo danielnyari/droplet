@@ -796,29 +796,57 @@ fixture — registered handle → handle-to-handle primitives → capped read-ou
 
 Tick all of these to call M1 complete (the spec's step-3 "Done when" expanded):
 
-- [ ] `duckdb = "1.10503"` with features `["bundled", "parquet", "json"]` (and only those) is pinned in
+- [x] `duckdb = "1.10503.1"` with features `["bundled", "parquet", "json"]` (and only those) is pinned in
   `[workspace.dependencies]` and gated behind an **opt-in** `duckdb` feature in `droplet-core`. Default
   build stays fast; a `// BUILD PATH` note records the prebuilt/`frozen-duckdb` escape hatch. **No
   `httpfs`/S3 setup anywhere — that's M6.**
-- [ ] Exactly **one** Arrow major in the tree (`cargo tree -i arrow` shows a single `58.x`), and the code
+- [x] Exactly **one** Arrow major in the tree (`cargo tree -i arrow` shows a single `58.3.0`), and the code
   names Arrow types via `duckdb::arrow` — no top-level `arrow` dependency.
-- [ ] Each `Session` owns its own ephemeral in-memory `Connection` behind a host-side `DuckEngine`
-  (invariants #3, #6); the sandbox never sees a `Connection`.
-- [ ] A **local** Parquet file registers as a `Dataset` **handle** (a DuckDB view under a monotonic
+- [x] Each `Session` owns its own ephemeral in-memory `Connection` behind a host-side `DuckEngine`
+  (invariants #3, #6); the sandbox never sees a `Connection`. (`duck()` + `duck_mut()` accessors.)
+- [x] A **local** Parquet file registers as a `Dataset` **handle** (a DuckDB view under a monotonic
   `ds_{n}` name); the handle is what crosses to the sandbox, never the rows (invariant #6).
-- [ ] The handle-to-handle primitives `filter_rows`, `group_agg`, and the unrestricted `local_sql(sql,
+- [x] The handle-to-handle primitives `filter_rows`, `group_agg`, and the unrestricted `local_sql(sql,
   datasets=…)` each return a **new `Dataset` handle**; only `to_rows` (capped via SQL `LIMIT` +
   `cap_batches`) and `scalar` move actual rows/values into the caller (invariants #3, #6).
-- [ ] `duckdb::Error` and `tokio::task::JoinError` both fold into `DropletError` via `#[from]` (the duckdb
+- [x] `duckdb::Error` and `tokio::task::JoinError` both fold into `DropletError` via `#[from]` (the duckdb
   variant feature-gated) — invariant #10.
-- [ ] The analyze work runs inside `tokio::task::spawn_blocking` and is awaited with `.await??`; the async
+- [x] The analyze work runs inside `tokio::task::spawn_blocking` and is awaited with `.await??`; the async
   runtime is never stalled (invariant #9). A comment forward-references the GIL release that will live in
   `droplet-py` (invariant #8).
-- [ ] A local-Parquet integration test drives `register_parquet → filter_rows → group_agg → to_rows`,
+- [x] A local-Parquet integration test drives `register_parquet → filter_rows → group_agg → to_rows`,
   asserts the small capped aggregate (`a→200, b→290, c→300`), and checks `scalar` (`790`) and `local_sql`.
 
 **Spec "Done when": a local analyze engine runs the dataframe primitives and `local_sql` over a local
-Parquet `Dataset`, capped, inside `spawn_blocking`.** ✅
+Parquet `Dataset`, capped, inside `spawn_blocking`.** ✅ **DONE.**
+
+---
+
+## M1 build corrections (back-ported after implementation)
+
+> Same convention as M0's back-ported corrections: anchors in the chunks above are kept as-is for the
+> learning narrative; the load-bearing facts that differed in reality are pinned here.
+
+- **DuckDB crate version is `1.10503.1`, not `1.10503`** — `1.10503.1` is the real latest on crates.io
+  (engine still DuckDB v1.5.3). The lockfile pins it exactly; engine bumps stay deliberate.
+- **Arrow major is `58.3.0`** — confirmed via `cargo tree -i arrow` (the chunk's `58.x` guess was right).
+- **`Statement::query_arrow` takes `&mut self`** — so `let mut stmt = conn.prepare(sql)?;` is required
+  (the "doesn't need mut" the chunk warned about was a different variable; the compiler is authoritative).
+- **DuckDB error `#[from]` lands with Chunk C, not D** — `Session::new` needs `?` to fold it when it
+  builds the engine. Functionally identical; just an earlier step.
+- **Invariant #3 is enforced STRUCTURALLY, not by "no httpfs loaded".** Bundled DuckDB *auto-loads*
+  `httpfs` on the first remote path and **does** reach S3/HTTP by default — "physically cannot reach a
+  source" was false. `new_in_memory` now sets `autoinstall/autoload_known_extensions=false` +
+  `disabled_filesystems='HTTPFileSystem,S3FileSystem'`. Do **not** use `enable_external_access=false` — it
+  also blocks the LOCAL file reads `register_parquet` needs. `disabled_filesystems` is a one-way latch
+  that holds even after an explicit `LOAD httpfs`. (Local-filesystem sandboxing remains an M6 concern.)
+- **`local_sql` binds aliases as CTEs, not lingering `TEMP VIEW`s.** Temp-view aliases are resolved by
+  name at query time, so reusing an alias for a different dataset silently changed what an *earlier*
+  handle returned (and an alias named `ds_N` could shadow a real handle). CTEs make each result view
+  self-contained.
+- **`group_agg` with an empty `by`** omits `GROUP BY` entirely (a grand-total) instead of emitting a
+  trailing `GROUP BY ` parser error.
+- **CI** gained a cached `--features duckdb` clippy/test step so the opt-in engine is actually exercised.
 
 When green, move on to [`M2-load-boundary.md`](./M2-load-boundary.md) — add the `load(name, columns,
 where, as_of) -> Dataset` boundary (a Catalog + the connector that materializes a slice locally) and the

@@ -2,6 +2,10 @@
 //!
 //! No `pyo3` here (invariant #8): the Python bridge lives only in `droplet-py`.
 
+// The DuckDB local analyze engine is conditionally compiled: included only when the
+// `duckdb` feature is active, so the default build never pulls in the C++ engine.
+#[cfg(feature = "duckdb")]
+pub mod engine_duckdb;
 pub mod registry;
 pub mod sandbox;
 pub mod session;
@@ -23,10 +27,21 @@ pub enum DropletError {
 
     #[error("monty error")]
     Monty(#[from] monty::MontyException),
+
+    // A blocking analyze task (spawn_blocking) panicked or was cancelled. Folding JoinError in
+    // lets the async entrypoint end in `.await??` with no manual mapping (invariant #10).
+    #[error("blocking task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    // The local analyze engine (M1). Feature-gated so the default build never references
+    // `duckdb`. `#[from]` auto-generates From<duckdb::Error>, so a `?` on any duckdb call
+    // inside a `Result<_, DropletError>` fn folds the error in (invariant #10).
+    #[cfg(feature = "duckdb")]
+    #[error("duckdb error: {0}")]
+    Duckdb(#[from] duckdb::Error),
 }
 
 // Future #[from] variants fold in as engines arrive (invariant #10):
-//   DuckDb(#[from] duckdb::Error)            // M1 (local analyze engine)
 //   Surreal(#[from] surrealdb::Error)        // M9 (read-only field search)
 //   S3 / Redis / DynamoDB / postcard / zstd / tokio::task::JoinError  // M5/M7/M8
 

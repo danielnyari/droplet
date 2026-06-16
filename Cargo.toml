@@ -24,3 +24,11 @@ pyo3        = { version = "0.28", features = ["abi3-py310"] }
 # Pre-1.0; the API churns. First build is long (pulls ty/ruff/salsa).
 monty       = { git = "https://github.com/pydantic/monty", tag = "v0.0.18" }
 anyhow      = "1.0.102"   # binaries only (invariant #10); libraries use thiserror
+# DuckDB = the LOCAL analyze engine (M1). Version scheme is NOT plain semver:
+# `1.<engine-major><minor 2d><patch 2d>.<crate-patch>` — so 1.10503.1 == DuckDB v1.5.3.
+# Engine upgrades are deliberate: the Cargo.lock pins the exact version; bumping needs `cargo update`.
+# BUILD PATH: using `bundled` for zero-setup (Cargo compiles DuckDB's C++ — slow first build, minutes).
+# If first-build time hurts, revisit a prebuilt lib (DUCKDB_DOWNLOAD_LIB=1) against the MATCHING upstream
+# version BEFORE reaching for the stale `frozen-duckdb` (0.1.0 targets an OLDER DuckDB; PRODUCT.md §18).
+# NO httpfs/S3 here — that's M6. Do NOT add a top-level `arrow` dep — use the `duckdb::arrow` re-export.
+duckdb      = { version = "1.10503.1", features = ["bundled", "parquet", "json"] }

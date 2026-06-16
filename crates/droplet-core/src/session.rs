@@ -20,8 +20,12 @@ pub struct Session {
     // The connector seam (invariant #1): any backend plugs in unchanged.
     // Dev impl now; Athena/S3 later (M6).
     source: Box<dyn Source>,
-    // Later milestones add (NOT in M0):
-    //   duck: duckdb::Connection             // M1 — ephemeral per-session local analyze engine
+    // The per-session local analyze engine (M1). Host-side behind the boundary — the sandbox
+    // never sees it (invariant #6). One ephemeral in-memory DuckDB per Session (invariant #3).
+    // Feature-gated with the engine itself, so the default build carries no DuckDB.
+    #[cfg(feature = "duckdb")]
+    duck: crate::engine_duckdb::DuckEngine,
+    // Later milestones add (NOT in M0/M1):
     //   surreal: read-only Surreal<Mem>      // M9 — schema-derived field search (read-only)
     //   artifacts: Box<dyn ArtifactStore>    // M5 — content-addressed load cache
     //   coord:     Box<dyn CoordinationStore>// M7 — run registry / leases / cache index
@@ -38,12 +42,34 @@ impl Session {
         // Default the connector to the local-Parquet dev impl, looking in the
         // session's own work_dir. M2's catalog decides this properly.
         let source: Box<dyn Source> = Box::new(LocalParquetSource::new(work_dir.clone()));
+        // One ephemeral in-memory DuckDB per Session, built right after the work dir.
+        // `?` folds duckdb::Error into DropletError (invariant #10).
+        #[cfg(feature = "duckdb")]
+        let duck = crate::engine_duckdb::DuckEngine::new_in_memory()?;
         Ok(Self {
             run_id: run_id.to_string(),
             work_dir,
             handles: Registry::new(),
             source,
+            #[cfg(feature = "duckdb")]
+            duck,
         })
+    }
+
+    /// Borrow the session's local analyze engine (host-side; invariant #6). Use this for the
+    /// read-out primitives (`to_rows`, `scalar_*`), which take `&self`.
+    #[cfg(feature = "duckdb")]
+    pub fn duck(&self) -> &crate::engine_duckdb::DuckEngine {
+        &self.duck
+    }
+
+    /// Mutably borrow the session's analyze engine. Required for the dataset-producing
+    /// primitives (`register_parquet`, `filter_rows`, `group_agg`, `local_sql`), which take
+    /// `&mut self` because they mint a new `ds_{n}` view. Without this the session-owned engine
+    /// would be unusable for its actual purpose.
+    #[cfg(feature = "duckdb")]
+    pub fn duck_mut(&mut self) -> &mut crate::engine_duckdb::DuckEngine {
+        &mut self.duck
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -97,6 +123,29 @@ mod tests {
             s.work_dir().to_path_buf()
         }; // session dropped here
         assert!(!path.exists(), "Drop should have wiped {path:?}");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn session_owns_a_live_duck_engine() {
+        // Session::new returning Ok already proves Connection::open_in_memory()
+        // succeeded (it is built with `?` inside new). Reaching `s.duck()` proves
+        // the engine lives behind the session boundary (invariant #6: host-side).
+        let s = Session::new("run-duck").unwrap();
+        let _engine: &crate::engine_duckdb::DuckEngine = s.duck();
+    }
+
+    /// The session-owned engine must be USABLE for analysis, not just readable: the
+    /// dataset-producing primitives take `&mut self`, so the session needs `duck_mut()`.
+    /// (Fails before `duck_mut` exists — the engine would be effectively write-only.)
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn session_engine_is_usable_for_analysis() -> Result<(), DropletError> {
+        let mut s = Session::new("run-duck-mut")?;
+        let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
+        let ds = s.duck_mut().register_parquet(&path)?;
+        assert_eq!(s.duck().scalar_i64(&ds, "SUM(amount)")?, 790);
+        Ok(())
     }
 
     #[tokio::test]
