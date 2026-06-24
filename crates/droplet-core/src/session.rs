@@ -255,6 +255,131 @@ mod tests {
         assert!(err.is_err(), "unknown tool must produce an error");
     }
 
+    /// Three regions for a richer analyze demo (region:str, amt:DOUBLE).
+    /// Grouped: EU total 150 / n 2 / avg 75; US 200 / 1 / 200; APAC 300 / 2 / 150.
+    fn write_demo_parquet(dir: &std::path::Path) -> String {
+        let path = dir.join("demo.parquet");
+        let p = path.to_str().unwrap().to_string();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT region, amt::DOUBLE AS amt FROM (VALUES \
+             ('EU', 100.0), ('EU', 50.0), ('US', 200.0), ('APAC', 300.0), ('APAC', 0.0)) \
+             AS t(region, amt)) TO '{p}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+        p
+    }
+
+    /// V1b "Done when": a multi-step analysis program over LOCAL handles — register → group_agg →
+    /// to_rows → the agent's own Python derives an average, BRANCHES on a threshold, and RANKS —
+    /// with rows crossing only at `to_rows` (everything else is a handle). The §20 analyze shape,
+    /// local-only (no load/cache/cross-pod yet).
+    #[test]
+    fn multi_step_analysis_over_handles() -> Result<(), DropletError> {
+        let dir = std::env::temp_dir().join("droplet-v1b-demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_demo_parquet(&dir);
+
+        let mut session = Session::new("run-v1b")?;
+        let code = [
+            format!("ds = register({path:?})"),
+            "agg = group_agg(ds, ['region'], [('total','SUM(amt)'), ('n','CAST(COUNT(*) AS BIGINT)')])"
+                .to_string(),
+            "ranked = []".to_string(),
+            "for r in to_rows(agg):".to_string(),
+            "    avg = r['total'] / r['n']".to_string(),
+            "    if avg >= 100:".to_string(),
+            "        ranked.append({'region': r['region'], 'avg': avg})".to_string(),
+            "ranked.sort(key=lambda x: -x['avg'])".to_string(),
+            "ranked".to_string(),
+        ]
+        .join("\n");
+
+        let value = session.run_code(&code)?;
+        // EU avg 75 dropped (<100); US 200 and APAC 150 kept, ranked descending.
+        let MontyObject::List(items) = value else {
+            panic!("expected ranked list, got {value:?}");
+        };
+        let ranked: Vec<(String, f64)> = items
+            .iter()
+            .map(|it| {
+                let MontyObject::Dict(pairs) = it else {
+                    panic!("each ranked entry is a dict")
+                };
+                let (mut region, mut avg) = (None, None);
+                for (k, v) in pairs.clone() {
+                    if let MontyObject::String(k) = k {
+                        match (k.as_str(), v) {
+                            ("region", MontyObject::String(s)) => region = Some(s),
+                            ("avg", MontyObject::Float(f)) => avg = Some(f),
+                            _ => {}
+                        }
+                    }
+                }
+                (region.unwrap(), avg.unwrap())
+            })
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![("US".to_string(), 200.0), ("APAC".to_string(), 150.0)]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Boundary discipline (invariant #6): handle-producing ops return an opaque integer handle to
+    /// the sandbox, NOT rows. Only `to_rows`/`scalar` move values.
+    #[test]
+    fn intermediate_ops_return_handles_not_rows() -> Result<(), DropletError> {
+        let dir = std::env::temp_dir().join("droplet-v1b-handles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_sales_parquet(&dir);
+
+        let mut session = Session::new("run-v1b-handles")?;
+        // register and group_agg each return a handle (an int), not a list of rows.
+        let h = session.run_code(&format!("register({path:?})"))?;
+        assert!(
+            matches!(h, MontyObject::Int(_)),
+            "register returns a handle"
+        );
+        let g = session.run_code(&format!(
+            "group_agg(register({path:?}), ['region'], [('t','SUM(amt)')])"
+        ))?;
+        assert!(
+            matches!(g, MontyObject::Int(_)),
+            "group_agg returns a handle, not rows"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Handles persist across `run_code` steps: a dataset registered in one step is usable in the
+    /// next (same Monty namespace + same session handle registry).
+    #[test]
+    fn handles_persist_across_run_code_steps() -> Result<(), DropletError> {
+        let dir = std::env::temp_dir().join("droplet-v1b-persist");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_sales_parquet(&dir);
+
+        let mut session = Session::new("run-v1b-persist")?;
+        session.run_code(&format!("ds = register({path:?})"))?; // step 1: handle bound to `ds`
+        let rows = session.run_code("to_rows(filter_rows(ds, 'amt > 60'))")?; // step 2: reuse `ds`
+        // amt>60 keeps EU 100 and US 200 (EU's 50 dropped) -> 2 rows.
+        let MontyObject::List(items) = rows else {
+            panic!("expected rows from step 2");
+        };
+        assert_eq!(
+            items.len(),
+            2,
+            "the handle from step 1 must still resolve in step 2"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[test]
     fn new_creates_a_fresh_work_dir() {
         let s = Session::new("run-123").unwrap();
