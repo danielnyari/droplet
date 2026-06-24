@@ -94,12 +94,17 @@ Each milestone lists **Ships** (the value), **Done when** (the runnable demo), a
 - **Ships:** the agent references **logical datasets** (not file paths); `load(name, columns, where,
   as_of)` pulls a bounded, typed slice through a `Source` connector → local Parquet; the agent never
   sees the source. Catalog-derived types make `columns`/`where` `Literal`-typed per dataset.
+  **Also closes the V1a local-file-read gap** (`docs/security/2026-06-24-v1a-local-fs-read-gap.md`):
+  removing agent-supplied paths + scoping the analyze engine's filesystem to the host-controlled
+  cache dir (DuckDB `allowed_directories` + `enable_external_access=false` + `lock_configuration`).
 - **Done when:** register a catalog, run `load(...)` + a multi-step analysis; swap the dev connector
-  underneath with **zero agent-code change**; a wrong field is now caught against the *catalog* schema.
+  underneath with **zero agent-code change**; a wrong field is now caught against the *catalog* schema;
+  **and** agent SQL that tries to `read_csv`/`read_blob`/`glob` a path outside the session cache dir
+  is rejected (the V1a exfil canary, flipped to assert *blocked*), while the cached Parquet still reads.
 - **PRODUCT.md:** §6, §9, §10 (load + discovery typing), §8 (runtime schema-derived stub fragments),
   §14 (load is the governed boundary). Invariants #1, #2, #4. §21 step 5 (load half).
 - **Why it's value:** the actual security model and the engine-agnostic abstraction become real and
-  demonstrable.
+  demonstrable — including closing the one accepted V1a exfiltration gap.
 
 ### V4 — Pull once, reuse (content-addressed cache)
 

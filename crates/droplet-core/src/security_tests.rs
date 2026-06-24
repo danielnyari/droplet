@@ -211,6 +211,9 @@ fn a_bad_column_fails_loudly_not_silently() {
 /// This is closed at the LOAD/connector boundary (PRODUCT.md §6/§14; replan V3): the agent stops
 /// passing paths, references logical datasets, and reads are scoped to host-controlled cache files.
 ///
+/// Full writeup (threat model, blast radius, verified DuckDB fix recipe, acceptance criteria):
+/// `docs/security/2026-06-24-v1a-local-fs-read-gap.md`.
+///
 /// This test asserts the CURRENT (vulnerable) behavior on purpose, so it FAILS LOUDLY the day
 /// local-FS scoping lands — at which point flip it to assert the read is blocked.
 #[test]

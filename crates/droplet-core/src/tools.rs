@@ -13,6 +13,11 @@ use crate::engine_duckdb::DuckEngine;
 /// The agent writes `FROM data` in `sql`; `data` is bound to the file at `path`. The engine's cap
 /// (invariant #6) bounds how many rows cross back. Local file only — the engine has the network
 /// filesystems disabled (invariant #3), so a remote path fails instantly with no egress.
+///
+/// SECURITY — ACCEPTED V1a GAP: the agent controls both `path` and `sql`, and the local filesystem
+/// is not sandboxed, so agent SQL can read arbitrary host files via `read_csv`/`read_blob`/`glob`
+/// (host-data exfiltration). Network egress and writes are blocked; local read is not. Closed at the
+/// V3 load boundary. Full writeup: `docs/security/2026-06-24-v1a-local-fs-read-gap.md`.
 #[droplet_tool]
 pub fn query(eng: &mut DuckEngine, path: String, sql: String) -> Result<Rows, DropletError> {
     let ds = eng.register_parquet(&path)?;

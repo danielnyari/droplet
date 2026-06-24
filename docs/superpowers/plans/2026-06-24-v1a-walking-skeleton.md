@@ -30,6 +30,15 @@ These apply to **every** task. Values copied verbatim from `PRODUCT.md`, the `dr
 - No `Dataset` handles crossing into the sandbox, no handle `Registry` retype, no `filter_rows`/`group_agg`/`join`/`window`/`local_sql`/`to_rows`/`scalar` as agent tools — that is **V1b**. `query` is self-contained.
 - No catalog, no `load`, no connectors, no cache, no snapshot.
 
+**Accepted security gap (tracked, fixed in V3):** `query(path, sql)` lets the agent read **arbitrary
+local host files** (`read_csv`/`read_blob`/`glob` on any path) — host-data exfiltration. The local
+filesystem is deliberately not sandboxed because the engine must read the local Parquet, and V1a's
+`query` hands the agent both the path and the SQL. Network egress, file writes, and Python OS escape
+**are** blocked (see `crates/droplet-core/src/security_tests.rs`). The gap is documented in full at
+`docs/security/2026-06-24-v1a-local-fs-read-gap.md`, pinned by the canary test
+`known_gap_local_file_read_is_currently_possible`, and closed at the **V3** load boundary (host-owned
+paths + DuckDB `allowed_directories`/`enable_external_access` scoping).
+
 ---
 
 ## File Structure

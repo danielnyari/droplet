@@ -51,8 +51,11 @@ impl DuckEngine {
     /// rejects clearing it on a running database — so even if arbitrary `local_sql` explicitly
     /// `LOAD`s httpfs, an `s3://`/`https://` read still fails instantly with a permission
     /// error and no network round-trip. (We deliberately do NOT use `enable_external_access`,
-    /// which would also block local-file reads. Local-filesystem sandboxing — e.g. COPY TO a
-    /// local path — is a separate concern handled with the connector boundary in M6.)
+    /// which would also block local-file reads. Local-filesystem sandboxing — e.g. reading
+    /// `/etc/passwd` via `read_csv` — is a separate, ACCEPTED V1a gap (host-data exfiltration),
+    /// closed at the V3 load boundary by scoping reads to the host-controlled cache dir
+    /// (`allowed_directories` + `enable_external_access=false`). Full writeup:
+    /// `docs/security/2026-06-24-v1a-local-fs-read-gap.md`.)
     pub fn new_in_memory() -> Result<Self, crate::DropletError> {
         let conn = Connection::open_in_memory()?; // duckdb::Error -> DropletError via #[from]
         conn.execute_batch(
