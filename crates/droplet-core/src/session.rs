@@ -85,13 +85,16 @@ impl Session {
     /// name to the `#[droplet_tool]`-registered tools (run against this session's local engine) and
     /// resumes (PRODUCT.md §8 execution model; invariant #6 keeps results capped & data host-side).
     ///
-    /// On a tool error the run aborts (the error folds into `DropletError`) and the session's REPL
-    /// is consumed; create a new `Session` to continue. (Graceful in-sandbox error resume is later.)
+    /// A recoverable agent error (undefined name, syntax error, calling an unregistered tool) raises
+    /// in the sandbox: `run_code` returns an `Err` but the session's REPL SURVIVES — the next call
+    /// runs against the same namespace (monty hands the REPL back via `ReplStartError`). A hard
+    /// tool/engine error (e.g. bad SQL inside `query`) instead consumes the REPL; a subsequent
+    /// `run_code` then returns a clean `DropletError`, never panics — make a new `Session`.
     pub fn run_code(&mut self, code: &str) -> Result<MontyObject, DropletError> {
-        let repl = self.repl.take().expect("session REPL present");
-        let mut progress = repl
-            .feed_start(code, vec![], PrintWriter::Disabled)
-            .map_err(start_err)?;
+        let repl = self.repl.take().ok_or_else(|| {
+            DropletError::NotFound("session REPL consumed by a prior failed run".into())
+        })?;
+        let mut progress = self.settle(repl.feed_start(code, vec![], PrintWriter::Disabled))?;
         loop {
             match progress {
                 ReplProgress::Complete { repl, value } => {
@@ -106,20 +109,15 @@ impl Session {
                             }
                             None => ExtFunctionResult::NotFound(call.function_name.clone()),
                         };
-                    progress = call
-                        .resume(reply, PrintWriter::Disabled)
-                        .map_err(start_err)?;
+                    progress = self.settle(call.resume(reply, PrintWriter::Disabled))?;
                 }
                 // Safe defaults for suspension kinds V1a doesn't use (carried from the M0 seam).
                 ReplProgress::OsCall(c) => {
-                    progress = c
-                        .resume(MontyObject::None, PrintWriter::Disabled)
-                        .map_err(start_err)?;
+                    progress = self.settle(c.resume(MontyObject::None, PrintWriter::Disabled))?;
                 }
                 ReplProgress::NameLookup(l) => {
-                    progress = l
-                        .resume(NameLookupResult::Undefined, PrintWriter::Disabled)
-                        .map_err(start_err)?;
+                    progress =
+                        self.settle(l.resume(NameLookupResult::Undefined, PrintWriter::Disabled))?;
                 }
                 ReplProgress::ResolveFutures(f) => {
                     let results: Vec<(u32, ExtFunctionResult)> = f
@@ -127,12 +125,23 @@ impl Session {
                         .iter()
                         .map(|&id| (id, ExtFunctionResult::Return(MontyObject::None)))
                         .collect();
-                    progress = f
-                        .resume(results, PrintWriter::Disabled)
-                        .map_err(start_err)?;
+                    progress = self.settle(f.resume(results, PrintWriter::Disabled))?;
                 }
             }
         }
+    }
+
+    /// Fold a feed/resume result into the boundary error type, RESTORING the surviving REPL on error
+    /// (monty's `ReplStartError` carries it) so a raised exception doesn't poison the session.
+    fn settle(
+        &mut self,
+        r: Result<ReplProgress<NoLimitTracker>, Box<ReplStartError<NoLimitTracker>>>,
+    ) -> Result<ReplProgress<NoLimitTracker>, DropletError> {
+        r.map_err(|e| {
+            let ReplStartError { repl, error } = *e;
+            self.repl = Some(repl);
+            DropletError::Monty(error)
+        })
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -167,12 +176,6 @@ impl Drop for Session {
         // Best-effort cleanup; never panic in a destructor.
         let _ = fs::remove_dir_all(&self.work_dir);
     }
-}
-
-/// Fold monty's boxed start/resume error (which carries the surviving REPL + the exception) into
-/// the one boundary error type (invariant #10). The surviving REPL is dropped — see run_code's note.
-fn start_err(e: Box<ReplStartError<NoLimitTracker>>) -> DropletError {
-    DropletError::Monty(e.error)
 }
 
 #[cfg(test)]

@@ -13,6 +13,10 @@ pub mod source;
 pub mod tool;
 pub mod tools;
 
+// Adversarial boundary tests for the agent surface (jailbreak / exfiltration attempts).
+#[cfg(test)]
+mod security_tests;
+
 /// The one boundary error type. Every engine error in Droplet (Monty, DuckDB,
 /// SurrealDB, S3, Redis, IO…) eventually folds into this single enum
 /// (invariant #10: thiserror in libraries, anyhow at binaries).
