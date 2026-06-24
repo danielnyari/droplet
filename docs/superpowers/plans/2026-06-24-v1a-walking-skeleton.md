@@ -778,16 +778,18 @@ mod tests {
     use monty::MontyObject;
 
     /// Write a tiny `sales.parquet` (region:str, amt:DOUBLE) via a throwaway DuckDB connection.
-    /// `amt` is DOUBLE on purpose: an un-cast `SUM(amt)` over an INTEGER column yields a DuckDB
-    /// HUGEINT (Arrow Decimal128), which the capped read-out does not yet decode; DOUBLE -> Float64
-    /// crosses cleanly. (Decoding HUGEINT is a later engine refinement.)
+    /// `amt` is cast to DOUBLE on purpose: a decimal literal like `100.0` is DECIMAL in DuckDB, and
+    /// `SUM` over DECIMAL/INTEGER widens to DECIMAL/HUGEINT (Arrow Decimal128) which the capped
+    /// read-out does not yet decode; DOUBLE -> Float64 crosses cleanly. (HUGEINT/DECIMAL decoding is
+    /// a later engine refinement.)
     fn write_sales_parquet(dir: &std::path::Path) -> String {
         let path = dir.join("sales.parquet");
         let p = path.to_str().unwrap().to_string();
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(&format!(
-            "COPY (SELECT * FROM (VALUES ('EU', 100.0), ('EU', 50.0), ('US', 200.0)) \
-             AS t(region, amt)) TO '{p}' (FORMAT PARQUET)"
+            "COPY (SELECT region, amt::DOUBLE AS amt \
+             FROM (VALUES ('EU', 100.0), ('EU', 50.0), ('US', 200.0)) AS t(region, amt)) \
+             TO '{p}' (FORMAT PARQUET)"
         ))
         .unwrap();
         p
@@ -959,8 +961,9 @@ In `crates/droplet-core/src/session.rs`'s `mod tests`, add:
         let p = path.to_str().unwrap().to_string();
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(&format!(
-            "COPY (SELECT * FROM (VALUES ('EU', 100.0), ('EU', 50.0), ('US', 200.0)) \
-             AS t(region, amt)) TO '{p}' (FORMAT PARQUET)"
+            "COPY (SELECT region, amt::DOUBLE AS amt \
+             FROM (VALUES ('EU', 100.0), ('EU', 50.0), ('US', 200.0)) AS t(region, amt)) \
+             TO '{p}' (FORMAT PARQUET)"
         ))
         .unwrap();
         p
