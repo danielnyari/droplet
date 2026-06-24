@@ -1,10 +1,14 @@
 //! The MontyObject ↔ Rust conversion seam. `#[droplet_tool]`-generated thunks read arguments via
-//! `FromMonty` and pack return values via `IntoMonty`, so the macro never bakes in type knowledge.
+//! `FromArg` and pack return values via `IntoRet` (the cx-aware traits), so the macro never bakes in
+//! type knowledge. `FromArg`/`IntoRet` bridge to the cx-free leaf conversions `FromMonty`/`IntoMonty`
+//! for scalars/compounds; `Dataset` handles cross as opaque integers resolved against the session
+//! handle registry (`ToolCx`), keeping rows host-side (invariant #6).
 
 use monty::MontyObject;
 
 use crate::DropletError;
-use crate::engine_duckdb::Value;
+use crate::engine_duckdb::{Dataset, Value};
+use crate::tool::ToolCx;
 
 /// Rust value → `MontyObject` (a tool's return value crossing back into the sandbox).
 pub trait IntoMonty {
@@ -106,6 +110,110 @@ impl IntoMonty for Rows {
             })
             .collect();
         MontyObject::List(list)
+    }
+}
+
+/// A Python `list`/`tuple` argument as a slice of elements; anything else is a `BadArg`.
+fn as_seq<'a>(o: &'a MontyObject, what: &str) -> Result<&'a [MontyObject], DropletError> {
+    match o {
+        MontyObject::List(v) | MontyObject::Tuple(v) => Ok(v),
+        other => Err(DropletError::BadArg(format!(
+            "expected {what}, got {other:?}"
+        ))),
+    }
+}
+
+impl FromMonty for Vec<String> {
+    fn from_monty(o: &MontyObject) -> Result<Self, DropletError> {
+        as_seq(o, "list[str]")?
+            .iter()
+            .map(String::from_monty)
+            .collect()
+    }
+}
+
+impl FromMonty for Vec<(String, String)> {
+    fn from_monty(o: &MontyObject) -> Result<Self, DropletError> {
+        as_seq(o, "list[tuple[str, str]]")?
+            .iter()
+            .map(|it| {
+                let pair = as_seq(it, "tuple[str, str]")?;
+                let [a, b] = pair else {
+                    return Err(DropletError::BadArg("expected a 2-tuple".into()));
+                };
+                Ok((String::from_monty(a)?, String::from_monty(b)?))
+            })
+            .collect()
+    }
+}
+
+// --- cx-aware conversions: what `#[droplet_tool]` calls --------------------------------------------
+//
+// `Dataset` and lists of datasets cross the boundary as opaque integer handles, so they need the
+// session handle registry (`cx.handles`). Leaf/cx-free types bridge to `FromMonty`/`IntoMonty`.
+// (No blanket `impl<T: FromMonty>` — that would collide with the `Dataset` impl under coherence;
+// each type bridges explicitly via the macros below.)
+
+/// `MontyObject` -> Rust tool argument, with access to the handle registry.
+pub trait FromArg: Sized {
+    fn from_arg(cx: &mut ToolCx, o: &MontyObject) -> Result<Self, DropletError>;
+}
+
+/// Rust tool return -> `MontyObject`, with access to the handle registry (a returned `Dataset` is
+/// inserted and crosses back as its integer handle).
+pub trait IntoRet {
+    fn into_ret(self, cx: &mut ToolCx) -> MontyObject;
+}
+
+macro_rules! from_arg_via_from_monty {
+    ($($t:ty),* $(,)?) => {$(
+        impl FromArg for $t {
+            fn from_arg(_cx: &mut ToolCx, o: &MontyObject) -> Result<Self, DropletError> {
+                <$t as FromMonty>::from_monty(o)
+            }
+        }
+    )*};
+}
+from_arg_via_from_monty!(String, i64, f64, bool, Vec<String>, Vec<(String, String)>);
+
+macro_rules! into_ret_via_into_monty {
+    ($($t:ty),* $(,)?) => {$(
+        impl IntoRet for $t {
+            fn into_ret(self, _cx: &mut ToolCx) -> MontyObject {
+                <$t as IntoMonty>::into_monty(self)
+            }
+        }
+    )*};
+}
+into_ret_via_into_monty!(String, i64, f64, bool, Rows);
+
+impl FromArg for Dataset {
+    fn from_arg(cx: &mut ToolCx, o: &MontyObject) -> Result<Self, DropletError> {
+        let handle = u64::try_from(i64::from_monty(o)?)
+            .map_err(|_| DropletError::BadArg("dataset handle must be non-negative".into()))?;
+        Ok(cx.handles.require(handle)?.clone())
+    }
+}
+
+impl IntoRet for Dataset {
+    fn into_ret(self, cx: &mut ToolCx) -> MontyObject {
+        // Keep the Dataset host-side (invariant #6); the sandbox gets only the opaque handle.
+        MontyObject::Int(cx.handles.insert(self) as i64)
+    }
+}
+
+impl FromArg for Vec<(String, Dataset)> {
+    fn from_arg(cx: &mut ToolCx, o: &MontyObject) -> Result<Self, DropletError> {
+        let items = as_seq(o, "list[tuple[str, Dataset]]")?;
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            let pair = as_seq(it, "tuple[str, Dataset]")?;
+            let [alias, handle] = pair else {
+                return Err(DropletError::BadArg("expected a 2-tuple".into()));
+            };
+            out.push((String::from_monty(alias)?, Dataset::from_arg(cx, handle)?));
+        }
+        Ok(out)
     }
 }
 

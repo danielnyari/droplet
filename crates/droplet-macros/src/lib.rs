@@ -2,6 +2,13 @@
 //! agent code: it re-emits the function, generates a Monty dispatch thunk and a Python `.pyi` stub
 //! line from the signature, and registers both at link time via `inventory`. There is no
 //! hand-maintained tool table or stub file anywhere (PRODUCT.md invariant #4).
+//!
+//! Calling convention: a tool is `fn NAME([cx: &mut ToolCx,] p1: T1, ...) -> Result<R, DropletError>`.
+//! An optional first `&mut ToolCx` param is the host context (engine + handle registry), passed
+//! through by the thunk and omitted from the stub. Every other `Ti`/`R` is converted via the
+//! `FromArg`/`IntoRet` seam, so the macro stays type-agnostic about conversions and only maps Rust
+//! types to Python types for the stub. Tools live in `droplet-core` (the generated code uses
+//! `crate::` paths).
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -15,10 +22,10 @@ pub fn droplet_tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let thunk_name = format_ident!("__droplet_dispatch_{}", fn_name);
 
-    // Split the engine parameter (if first and typed &mut DuckEngine) from the agent-visible ones.
+    // Split the host-context parameter (if the first param is `&mut ToolCx`) from agent-visible ones.
     let params: Vec<&FnArg> = func.sig.inputs.iter().collect();
-    let engine_first = params.first().is_some_and(|a| is_engine_param(a));
-    let visible: Vec<&FnArg> = if engine_first {
+    let cx_first = params.first().is_some_and(|a| is_cx_param(a));
+    let visible: Vec<&FnArg> = if cx_first {
         params[1..].to_vec()
     } else {
         params.clone()
@@ -38,19 +45,13 @@ pub fn droplet_tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
         arg_types.push((*pt.ty).clone());
     }
 
-    // The thunk converts args via FromMonty, calls the fn (engine passed through if present), and
-    // packs the return via IntoMonty. Tools return Result<R, DropletError>, so `?` propagates.
+    // The thunk converts args via FromArg, calls the fn (cx passed through if present), and packs the
+    // return via IntoRet. Tools return Result<R, DropletError>, so `?` propagates.
     let indices: Vec<syn::Index> = (0..arg_idents.len()).map(syn::Index::from).collect();
-    let call = if engine_first {
-        quote! { #fn_name(eng, #(#arg_idents),*) }
+    let call = if cx_first {
+        quote! { #fn_name(cx, #(#arg_idents),*) }
     } else {
         quote! { #fn_name(#(#arg_idents),*) }
-    };
-    let engine_binding = if engine_first {
-        quote! {}
-    } else {
-        // Engine is unused for engine-less tools; silence the warning without renaming the param.
-        quote! { let _ = &mut *eng; }
     };
 
     // The Python stub line, e.g. `def echo(text: str) -> str: ...`.
@@ -62,14 +63,13 @@ pub fn droplet_tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         fn #thunk_name(
-            eng: &mut crate::engine_duckdb::DuckEngine,
+            cx: &mut crate::tool::ToolCx,
             args: &[::monty::MontyObject],
             _kwargs: &[(::monty::MontyObject, ::monty::MontyObject)],
         ) -> ::core::result::Result<::monty::MontyObject, crate::DropletError> {
-            #engine_binding
-            #( let #arg_idents = <#arg_types as crate::convert::FromMonty>::from_monty(&args[#indices])?; )*
+            #( let #arg_idents = <#arg_types as crate::convert::FromArg>::from_arg(cx, &args[#indices])?; )*
             let __ret = #call?;
-            ::core::result::Result::Ok(crate::convert::IntoMonty::into_monty(__ret))
+            ::core::result::Result::Ok(crate::convert::IntoRet::into_ret(__ret, cx))
         }
 
         ::inventory::submit! {
@@ -83,13 +83,13 @@ pub fn droplet_tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// True if this parameter is `eng: &mut DuckEngine` (the injected host engine).
-fn is_engine_param(arg: &FnArg) -> bool {
+/// True if this parameter is `cx: &mut ToolCx` (the injected host context).
+fn is_cx_param(arg: &FnArg) -> bool {
     let FnArg::Typed(pt) = arg else { return false };
     let Type::Reference(r) = &*pt.ty else {
         return false;
     };
-    r.mutability.is_some() && last_ident(&r.elem).as_deref() == Some("DuckEngine")
+    r.mutability.is_some() && last_ident(&r.elem).as_deref() == Some("ToolCx")
 }
 
 /// The last path-segment identifier of a type (`&str` -> "str", `Rows` -> "Rows", etc.).
@@ -101,17 +101,44 @@ fn last_ident(ty: &Type) -> Option<String> {
     }
 }
 
-/// Rust type -> Python stub type. Unknown -> "object" (callers should add a known mapping instead).
+/// Rust type -> Python stub type. Handles references, `Vec<T>` -> `list[T]`, tuples, and the leaf
+/// types the tools use. Unknown -> "object" (add a mapping rather than guessing silently).
 fn python_type(ty: &Type) -> String {
-    match last_ident(ty).as_deref() {
-        Some("String" | "str") => "str",
-        Some("i64") => "int",
-        Some("f64") => "float",
-        Some("bool") => "bool",
-        Some("Rows") => "list[dict]",
-        _ => "object",
+    match ty {
+        Type::Reference(r) => python_type(&r.elem),
+        Type::Tuple(t) => {
+            let inner = t
+                .elems
+                .iter()
+                .map(python_type)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("tuple[{inner}]")
+        }
+        Type::Path(p) => {
+            let Some(seg) = p.path.segments.last() else {
+                return "object".to_string();
+            };
+            let name = seg.ident.to_string();
+            if name == "Vec"
+                && let syn::PathArguments::AngleBracketed(ab) = &seg.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = ab.args.first()
+            {
+                return format!("list[{}]", python_type(inner));
+            }
+            match name.as_str() {
+                "String" | "str" => "str",
+                "i64" => "int",
+                "f64" => "float",
+                "bool" => "bool",
+                "Rows" => "list[dict]",
+                "Dataset" => "Dataset",
+                _ => "object",
+            }
+            .to_string()
+        }
+        _ => "object".to_string(),
     }
-    .to_string()
 }
 
 /// The Python return type from `-> Result<R, DropletError>` (or from a bare `-> R`).

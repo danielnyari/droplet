@@ -13,16 +13,17 @@ use monty::{
 };
 
 use crate::DropletError;
+use crate::engine_duckdb::Dataset;
 use crate::registry::Registry;
 use crate::source::{LocalParquetSource, Source};
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolCx};
 
 pub struct Session {
     run_id: String,
     work_dir: PathBuf,
-    // One registry per session. The stored type is a placeholder for now;
-    // it becomes the real engine-handle type when DuckDB lands in M1.
-    handles: Registry<()>,
+    // The per-session handle store: `Dataset`s live host-side here (invariant #6) while the sandbox
+    // holds only the opaque integer handles the tools hand back. Wired into `ToolCx` for run_code.
+    handles: Registry<Dataset>,
     // The connector seam (invariant #1): any backend plugs in unchanged.
     // Dev impl now; Athena/S3 later (M6).
     source: Box<dyn Source>,
@@ -105,7 +106,11 @@ impl Session {
                     let reply: ExtFunctionResult =
                         match inventory::iter::<Tool>().find(|t| t.name == call.function_name) {
                             Some(tool) => {
-                                (tool.dispatch)(&mut self.duck, &call.args, &call.kwargs)?.into()
+                                let mut cx = ToolCx {
+                                    engine: &mut self.duck,
+                                    handles: &mut self.handles,
+                                };
+                                (tool.dispatch)(&mut cx, &call.args, &call.kwargs)?.into()
                             }
                             None => ExtFunctionResult::NotFound(call.function_name.clone()),
                         };
@@ -152,8 +157,8 @@ impl Session {
         &self.run_id
     }
 
-    /// Borrow the session's handle registry.
-    pub fn handles(&self) -> &Registry<()> {
+    /// Borrow the session's handle registry (host-side `Dataset`s behind opaque handles).
+    pub fn handles(&self) -> &Registry<Dataset> {
         &self.handles
     }
 

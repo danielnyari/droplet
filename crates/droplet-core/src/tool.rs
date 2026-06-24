@@ -5,12 +5,22 @@
 use monty::MontyObject;
 
 use crate::DropletError;
-use crate::engine_duckdb::DuckEngine;
+use crate::engine_duckdb::{Dataset, DuckEngine};
+use crate::registry::Registry;
 
-/// A tool's host implementation: unpack args, run against the local engine, pack the return value.
-/// `#[droplet_tool]` generates one of these per tool (Task 4).
+/// The host-side context a tool runs against: the session's local analyze engine plus the handle
+/// registry that keeps `Dataset`s host-side (invariant #6) while the sandbox holds only opaque
+/// integer handles. `#[droplet_tool]` functions take `&mut ToolCx` as their first parameter when
+/// they need either; the generated dispatch thunk always receives it (to convert handle args/rets).
+pub struct ToolCx<'a> {
+    pub engine: &'a mut DuckEngine,
+    pub handles: &'a mut Registry<Dataset>,
+}
+
+/// A tool's host implementation: unpack args (resolving handles via `cx`), run against the engine,
+/// pack the return (registering handles via `cx`). `#[droplet_tool]` generates one of these per tool.
 pub type DispatchFn = fn(
-    &mut DuckEngine,
+    &mut ToolCx,
     &[MontyObject],
     &[(MontyObject, MontyObject)],
 ) -> Result<MontyObject, DropletError>;
@@ -29,8 +39,19 @@ mod tests {
     use super::*;
     use droplet_macros::droplet_tool;
 
-    /// Trivial tool with NO engine parameter — exercises the macro's arg conversion + stub gen +
-    /// submission path without DuckDB. (The real engine-using tool is `query`, Task 5.)
+    /// Build a throwaway context (fresh engine + empty handle registry) to drive a dispatch fn.
+    fn with_cx<R>(f: impl FnOnce(&mut ToolCx) -> R) -> R {
+        let mut engine = DuckEngine::new_in_memory().unwrap();
+        let mut handles = Registry::new();
+        let mut cx = ToolCx {
+            engine: &mut engine,
+            handles: &mut handles,
+        };
+        f(&mut cx)
+    }
+
+    /// Trivial tool with NO context parameter — exercises the macro's arg conversion + stub gen +
+    /// submission path without touching engine/handles. (Real tools are in tools.rs.)
     #[droplet_tool]
     pub fn echo(text: String) -> Result<String, DropletError> {
         Ok(text)
@@ -41,11 +62,11 @@ mod tests {
         let tool = inventory::iter::<Tool>()
             .find(|t| t.name == "echo")
             .expect("echo tool must be registered by #[droplet_tool]");
-        // Stub fragment is generated from the signature; the engine param (none here) is omitted.
+        // Stub fragment is generated from the signature; the context param (none here) is omitted.
         assert_eq!(tool.stub, "def echo(text: str) -> str: ...");
         // Dispatch converts MontyObject args -> Rust, runs, converts the return back.
-        let mut eng = DuckEngine::new_in_memory().unwrap();
-        let out = (tool.dispatch)(&mut eng, &[MontyObject::String("hi".into())], &[]).unwrap();
+        let out =
+            with_cx(|cx| (tool.dispatch)(cx, &[MontyObject::String("hi".into())], &[])).unwrap();
         assert_eq!(out, MontyObject::String("hi".into()));
     }
 
@@ -54,16 +75,15 @@ mod tests {
         let tool = inventory::iter::<Tool>()
             .find(|t| t.name == "echo")
             .unwrap();
-        let mut eng = DuckEngine::new_in_memory().unwrap();
         // Passing an int where echo wants a str must surface as BadArg (a retryable boundary error).
-        let err = (tool.dispatch)(&mut eng, &[MontyObject::Int(1)], &[]).unwrap_err();
+        let err = with_cx(|cx| (tool.dispatch)(cx, &[MontyObject::Int(1)], &[])).unwrap_err();
         assert!(matches!(err, DropletError::BadArg(_)));
     }
 
     // A test-only tool, submitted by hand HERE ONLY to prove the inventory plumbing collects and
-    // iterates. Real tools are submitted by #[droplet_tool] (Task 4), never by hand.
+    // iterates. Real tools are submitted by #[droplet_tool], never by hand.
     fn dispatch_noop(
-        _eng: &mut DuckEngine,
+        _cx: &mut ToolCx,
         _args: &[MontyObject],
         _kwargs: &[(MontyObject, MontyObject)],
     ) -> Result<MontyObject, DropletError> {
