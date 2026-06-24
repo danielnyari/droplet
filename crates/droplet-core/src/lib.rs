@@ -4,6 +4,7 @@
 
 // The DuckDB local analyze engine is a core, always-compiled module — the analyze surface
 // the `droplet-py` wheel binds to. (It used to be feature-gated; it no longer is.)
+pub mod convert;
 pub mod engine_duckdb;
 pub mod registry;
 pub mod sandbox;
@@ -41,6 +42,11 @@ pub enum DropletError {
     // (M1 supports the types the analyze surface produces; the richer typed-value work is later).
     #[error("unsupported column type: {0}")]
     UnsupportedType(String),
+
+    // A tool received an argument whose MontyObject type didn't match the Rust parameter type
+    // (e.g. an int where a str was expected). Surfaces from FromMonty at the sandbox boundary.
+    #[error("bad tool argument: {0}")]
+    BadArg(String),
 }
 
 // Future #[from] variants fold in as engines arrive (invariant #10):
