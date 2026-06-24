@@ -10,6 +10,7 @@ pub mod registry;
 pub mod sandbox;
 pub mod session;
 pub mod source;
+pub mod tool;
 
 /// The one boundary error type. Every engine error in Droplet (Monty, DuckDB,
 /// SurrealDB, S3, Redis, IO…) eventually folds into this single enum

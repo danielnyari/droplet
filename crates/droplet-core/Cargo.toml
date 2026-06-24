@@ -15,3 +15,6 @@ monty.workspace       = true
 # every Droplet build carries the engine, and `droplet-py` binds to it directly. The cost is a
 # slow first build (Cargo compiles DuckDB's bundled C++); `Cargo.lock` + CI caching absorb it.
 duckdb.workspace = true
+# The #[droplet_tool] proc-macro and the link-time table it submits into (invariant #4).
+droplet-macros.workspace = true
+inventory.workspace      = true
