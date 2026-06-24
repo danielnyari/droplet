@@ -635,6 +635,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "droplet-macros"
+version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "droplet-py"
 version = "0.0.1"
 dependencies = [

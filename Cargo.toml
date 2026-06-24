@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/droplet-core", "crates/droplet-py", "xtask"]
+members = ["crates/droplet-core", "crates/droplet-macros", "crates/droplet-py", "xtask"]
 
 [workspace.package]
 edition    = "2024"
@@ -32,3 +32,13 @@ anyhow      = "1.0.102"   # binaries only (invariant #10); libraries use thiserr
 # version BEFORE reaching for the stale `frozen-duckdb` (0.1.0 targets an OLDER DuckDB; PRODUCT.md §18).
 # NO httpfs/S3 here — that's M6. Do NOT add a top-level `arrow` dep — use the `duckdb::arrow` re-export.
 duckdb      = { version = "1.10503.1", features = ["bundled", "parquet", "json"] }
+# The #[droplet_tool] proc-macro (V1a). syn parses the Rust fn signature; quote builds the
+# generated Monty dispatch thunk + .pyi stub; proc-macro2 is the token type they share.
+syn         = { version = "2", features = ["full"] }
+quote       = "1"
+proc-macro2 = "1"
+# Link-time collection of every #[droplet_tool] into one dispatch table — invariant #4's
+# "no hand-maintained registry". verify: 0.3.x resolves; survives into the cdylib (Task 7).
+inventory   = "0.3"
+# droplet-macros is a path member; referenced by droplet-core below.
+droplet-macros = { path = "crates/droplet-macros" }
