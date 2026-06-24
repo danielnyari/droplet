@@ -189,16 +189,25 @@ Each milestone lists **Ships** (the value), **Done when** (the runnable demo), a
 
 ## 6. Current state vs the new spine
 
-Work already done this session maps to **V1, partially**:
+**V1 is COMPLETE** (V1a + V1b, branch `m0-skeleton`, 2026-06-24). The full local analyze surface
+runs in code mode through Monty:
 
-- Have: `DropletError`, `Registry`, `Session` (wiped work dir), `Source` trait + local-Parquet dev
-  connector, the DuckDB analyze engine (`register_parquet`/`filter_rows`/`group_agg`/`local_sql`,
-  capped `to_rows`/`scalar`, configurable cap), the Arrow→plain-rows readout, a Monty suspend/resume
-  *seam* (test-only), and a **direct** `droplet-py` `Engine` binding.
-- **Not yet V1:** the Monty **driver** (`run_code` loop), the `#[droplet_tool]` macro + auto-bootstrap,
-  the external-fn dispatch. The direct `Engine` binding is an **SDK/test convenience**, not the
-  code-mode product surface (per §1/§8 the agent reaches tools *through Monty*, not via an imperative
-  host API) — it stays as a test seam, clearly labeled, and is not mistaken for the product.
+- **V1a** (walking skeleton): the `#[droplet_tool]` proc-macro built **for real** (`droplet-macros`),
+  link-time tool collection (`inventory`), the `run_code` driver on `Session` (suspend/resume +
+  by-name dispatch), and a `query(path, sql)` tool. Plan: `docs/superpowers/plans/2026-06-24-v1a-walking-skeleton.md`.
+- **V1b** (full surface): `Dataset` handles cross the boundary as opaque integers via a session
+  `Registry<Dataset>` (invariant #6); the cx-aware `FromArg`/`IntoRet` conversion seam + `ToolCx`;
+  macro-generated tools `register`/`filter_rows`/`group_agg`/`with_column`/`join`/`sort`/`local_sql`/
+  `to_rows`/`scalar`. Multi-step analyze (group → derive → branch → rank) demoed pure-Rust and through
+  the `droplet-py` `Session.run_code` wheel.
+- Carried forward: `DropletError`, `Source` trait + local-Parquet dev connector, the DuckDB engine,
+  the capped Arrow→plain-rows readout. The direct `Engine` binding remains an **SDK/test convenience**
+  (the product surface is code-mode *through Monty*, per §1/§8) — labeled, not mistaken for the product.
+- **Accepted V1 gap:** `register`/`query` take agent-supplied paths + SQL, so an agent can read local
+  host files (`docs/security/2026-06-24-v1a-local-fs-read-gap.md`). Network egress, writes, and Python
+  OS escape are blocked. Closed at **V3** (governed load + FS scoping).
+- **Not in V1** (next milestones): type-check-before-run (**V2**); `load`/catalog/connectors/cache
+  (**V3+**); snapshot/resume (**V6+**).
 
 ## 7. Risks / honest costs
 
