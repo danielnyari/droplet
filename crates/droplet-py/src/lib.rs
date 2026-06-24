@@ -9,6 +9,8 @@
 //! the GIL while it works (invariant #9). No pyo3 types ever leak into core — only plain
 //! values/handles cross.
 
+use monty::MontyObject;
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -32,6 +34,39 @@ fn set_cell(dict: &Bound<'_, PyDict>, key: String, value: Value) -> PyResult<()>
         Value::Float(f) => dict.set_item(key, f),
         Value::Str(s) => dict.set_item(key, s),
     }
+}
+
+/// Convert a `MontyObject` (a run_code result) into a native Python object. V1a covers the shapes a
+/// tool can return: scalars, None, and `list[dict]` (built recursively). Anything else is an error
+/// rather than a silent guess.
+fn monty_to_py(py: Python<'_>, obj: &MontyObject) -> PyResult<Py<PyAny>> {
+    let out = match obj {
+        MontyObject::None => py.None(),
+        MontyObject::Bool(b) => b.into_py_any(py)?,
+        MontyObject::Int(i) => i.into_py_any(py)?,
+        MontyObject::Float(f) => f.into_py_any(py)?,
+        MontyObject::String(s) => s.into_py_any(py)?,
+        MontyObject::List(items) => {
+            let list = PyList::empty(py);
+            for it in items {
+                list.append(monty_to_py(py, it)?)?;
+            }
+            list.into_py_any(py)?
+        }
+        MontyObject::Dict(pairs) => {
+            let dict = PyDict::new(py);
+            for (k, v) in pairs.clone() {
+                dict.set_item(monty_to_py(py, &k)?, monty_to_py(py, &v)?)?;
+            }
+            dict.into_py_any(py)?
+        }
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "run_code returned an unsupported value: {other:?}"
+            )));
+        }
+    };
+    Ok(out)
 }
 
 /// An opaque dataset handle — the Python face of a host-side DuckDB view (invariant #6). It
@@ -156,10 +191,35 @@ impl Engine {
     }
 }
 
+/// A Droplet run: drives agent code in the Monty sandbox via `run_code`. `unsendable` for the same
+/// `!Sync` reason as `Engine` (it owns the ephemeral DuckDB connection) — pinned to its thread.
+#[pyclass(name = "Session", unsendable)]
+pub struct Session {
+    inner: droplet_core::session::Session,
+}
+
+#[pymethods]
+impl Session {
+    #[new]
+    fn new(run_id: &str) -> PyResult<Self> {
+        let inner = droplet_core::session::Session::new(run_id).map_err(to_pyerr)?;
+        Ok(Self { inner })
+    }
+
+    /// Run one agent program in the sandbox; return its result as native Python. The GIL is released
+    /// for the duration (invariant #9): Monty + DuckDB are pure Rust and don't need it, so other
+    /// Python threads run meanwhile.
+    fn run_code(&mut self, py: Python<'_>, code: &str) -> PyResult<Py<PyAny>> {
+        let result = py.detach(|| self.inner.run_code(code)).map_err(to_pyerr)?;
+        monty_to_py(py, &result)
+    }
+}
+
 // Function-style #[pymodule]: the param is &Bound<'_, PyModule>.
 #[pymodule]
 fn _droplet(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<Dataset>()?;
+    m.add_class::<Session>()?;
     Ok(())
 }

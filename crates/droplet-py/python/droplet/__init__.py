@@ -6,6 +6,6 @@ surface (Catalog, Session, run_code, backend + connector config) grows here in l
 milestones (PRODUCT.md §17).
 """
 
-from ._droplet import Dataset, Engine
+from ._droplet import Dataset, Engine, Session
 
-__all__ = ["Dataset", "Engine"]
+__all__ = ["Dataset", "Engine", "Session"]

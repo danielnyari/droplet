@@ -650,6 +650,7 @@ name = "droplet-py"
 version = "0.0.1"
 dependencies = [
  "droplet-core",
+ "monty",
  "pyo3",
 ]
 
