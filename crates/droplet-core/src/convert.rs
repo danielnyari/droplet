@@ -58,7 +58,9 @@ impl FromMonty for f64 {
     fn from_monty(o: &MontyObject) -> Result<Self, DropletError> {
         match o {
             MontyObject::Float(f) => Ok(*f),
-            other => Err(DropletError::BadArg(format!("expected float, got {other:?}"))),
+            other => Err(DropletError::BadArg(format!(
+                "expected float, got {other:?}"
+            ))),
         }
     }
 }
@@ -66,7 +68,9 @@ impl FromMonty for bool {
     fn from_monty(o: &MontyObject) -> Result<Self, DropletError> {
         match o {
             MontyObject::Bool(b) => Ok(*b),
-            other => Err(DropletError::BadArg(format!("expected bool, got {other:?}"))),
+            other => Err(DropletError::BadArg(format!(
+                "expected bool, got {other:?}"
+            ))),
         }
     }
 }

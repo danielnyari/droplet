@@ -48,7 +48,10 @@ mod tests {
         let tool = inventory::iter::<crate::tool::Tool>()
             .find(|t| t.name == "query")
             .expect("query must be registered");
-        assert_eq!(tool.stub, "def query(path: str, sql: str) -> list[dict]: ...");
+        assert_eq!(
+            tool.stub,
+            "def query(path: str, sql: str) -> list[dict]: ..."
+        );
     }
 
     #[test]
@@ -65,7 +68,9 @@ mod tests {
             &mut eng,
             &[
                 MontyObject::String(path),
-                MontyObject::String("SELECT region, SUM(amt) AS t FROM data GROUP BY region".into()),
+                MontyObject::String(
+                    "SELECT region, SUM(amt) AS t FROM data GROUP BY region".into(),
+                ),
             ],
             &[],
         )
@@ -77,7 +82,9 @@ mod tests {
         };
         let mut got = std::collections::BTreeMap::new();
         for it in items {
-            let MontyObject::Dict(pairs) = it else { panic!() };
+            let MontyObject::Dict(pairs) = it else {
+                panic!()
+            };
             let (mut region, mut t) = (None, None);
             for (k, v) in pairs.clone() {
                 if let MontyObject::String(k) = k {

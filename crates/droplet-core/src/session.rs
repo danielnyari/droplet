@@ -106,7 +106,9 @@ impl Session {
                             }
                             None => ExtFunctionResult::NotFound(call.function_name.clone()),
                         };
-                    progress = call.resume(reply, PrintWriter::Disabled).map_err(start_err)?;
+                    progress = call
+                        .resume(reply, PrintWriter::Disabled)
+                        .map_err(start_err)?;
                 }
                 // Safe defaults for suspension kinds V1a doesn't use (carried from the M0 seam).
                 ReplProgress::OsCall(c) => {
@@ -125,7 +127,9 @@ impl Session {
                         .iter()
                         .map(|&id| (id, ExtFunctionResult::Return(MontyObject::None)))
                         .collect();
-                    progress = f.resume(results, PrintWriter::Disabled).map_err(start_err)?;
+                    progress = f
+                        .resume(results, PrintWriter::Disabled)
+                        .map_err(start_err)?;
                 }
             }
         }
@@ -213,7 +217,9 @@ mod tests {
         };
         let mut got = std::collections::BTreeMap::new();
         for it in items {
-            let MontyObject::Dict(pairs) = it else { panic!() };
+            let MontyObject::Dict(pairs) = it else {
+                panic!()
+            };
             let (mut region, mut t) = (None, None);
             for (k, v) in pairs.clone() {
                 if let MontyObject::String(k) = k {

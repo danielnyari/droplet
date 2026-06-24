@@ -51,7 +51,9 @@ mod tests {
 
     #[test]
     fn dispatch_reports_bad_argument_type() {
-        let tool = inventory::iter::<Tool>().find(|t| t.name == "echo").unwrap();
+        let tool = inventory::iter::<Tool>()
+            .find(|t| t.name == "echo")
+            .unwrap();
         let mut eng = DuckEngine::new_in_memory().unwrap();
         // Passing an int where echo wants a str must surface as BadArg (a retryable boundary error).
         let err = (tool.dispatch)(&mut eng, &[MontyObject::Int(1)], &[]).unwrap_err();
