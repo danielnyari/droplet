@@ -58,3 +58,10 @@ def test_handles_persist_across_steps(tmp_path):
     rows = session.run_code("to_rows(filter_rows(ds, 'amt >= 100'))")
     # amt>=100 keeps EU 100, US 200, APAC 300 -> 3 rows; the step-1 handle still resolves.
     assert len(rows) == 3
+
+
+def test_run_code_result_converts_tuples():
+    # Agents routinely return tuples (e.g. list-of-tuples); the wheel must convert them, not error.
+    session = droplet.Session("py-tuples")
+    assert session.run_code("(1, 'a', 2.5)") == (1, "a", 2.5)
+    assert session.run_code("[(x, x * x) for x in [1, 2, 3]]") == [(1, 1), (2, 4), (3, 9)]

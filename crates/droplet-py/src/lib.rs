@@ -13,7 +13,7 @@ use monty::MontyObject;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use droplet_core::DropletError;
 use droplet_core::engine_duckdb::{Dataset as CoreDataset, DuckEngine, Value};
@@ -36,9 +36,9 @@ fn set_cell(dict: &Bound<'_, PyDict>, key: String, value: Value) -> PyResult<()>
     }
 }
 
-/// Convert a `MontyObject` (a run_code result) into a native Python object. V1a covers the shapes a
-/// tool can return: scalars, None, and `list[dict]` (built recursively). Anything else is an error
-/// rather than a silent guess.
+/// Convert a `MontyObject` (a run_code result) into a native Python object: scalars, None, and the
+/// common containers an agent program returns — `list`, `tuple`, `dict` — built recursively.
+/// Anything else is an error rather than a silent guess.
 fn monty_to_py(py: Python<'_>, obj: &MontyObject) -> PyResult<Py<PyAny>> {
     let out = match obj {
         MontyObject::None => py.None(),
@@ -52,6 +52,13 @@ fn monty_to_py(py: Python<'_>, obj: &MontyObject) -> PyResult<Py<PyAny>> {
                 list.append(monty_to_py(py, it)?)?;
             }
             list.into_py_any(py)?
+        }
+        MontyObject::Tuple(items) => {
+            let elems = items
+                .iter()
+                .map(|it| monty_to_py(py, it))
+                .collect::<PyResult<Vec<_>>>()?;
+            PyTuple::new(py, elems)?.into_py_any(py)?
         }
         MontyObject::Dict(pairs) => {
             let dict = PyDict::new(py);
