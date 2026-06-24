@@ -22,8 +22,6 @@ pub struct Session {
     source: Box<dyn Source>,
     // The per-session local analyze engine (M1). Host-side behind the boundary — the sandbox
     // never sees it (invariant #6). One ephemeral in-memory DuckDB per Session (invariant #3).
-    // Feature-gated with the engine itself, so the default build carries no DuckDB.
-    #[cfg(feature = "duckdb")]
     duck: crate::engine_duckdb::DuckEngine,
     // Later milestones add (NOT in M0/M1):
     //   surreal: read-only Surreal<Mem>      // M9 — schema-derived field search (read-only)
@@ -44,21 +42,18 @@ impl Session {
         let source: Box<dyn Source> = Box::new(LocalParquetSource::new(work_dir.clone()));
         // One ephemeral in-memory DuckDB per Session, built right after the work dir.
         // `?` folds duckdb::Error into DropletError (invariant #10).
-        #[cfg(feature = "duckdb")]
         let duck = crate::engine_duckdb::DuckEngine::new_in_memory()?;
         Ok(Self {
             run_id: run_id.to_string(),
             work_dir,
             handles: Registry::new(),
             source,
-            #[cfg(feature = "duckdb")]
             duck,
         })
     }
 
     /// Borrow the session's local analyze engine (host-side; invariant #6). Use this for the
     /// read-out primitives (`to_rows`, `scalar_*`), which take `&self`.
-    #[cfg(feature = "duckdb")]
     pub fn duck(&self) -> &crate::engine_duckdb::DuckEngine {
         &self.duck
     }
@@ -67,7 +62,6 @@ impl Session {
     /// primitives (`register_parquet`, `filter_rows`, `group_agg`, `local_sql`), which take
     /// `&mut self` because they mint a new `ds_{n}` view. Without this the session-owned engine
     /// would be unusable for its actual purpose.
-    #[cfg(feature = "duckdb")]
     pub fn duck_mut(&mut self) -> &mut crate::engine_duckdb::DuckEngine {
         &mut self.duck
     }
@@ -125,7 +119,6 @@ mod tests {
         assert!(!path.exists(), "Drop should have wiped {path:?}");
     }
 
-    #[cfg(feature = "duckdb")]
     #[test]
     fn session_owns_a_live_duck_engine() {
         // Session::new returning Ok already proves Connection::open_in_memory()
@@ -138,7 +131,6 @@ mod tests {
     /// The session-owned engine must be USABLE for analysis, not just readable: the
     /// dataset-producing primitives take `&mut self`, so the session needs `duck_mut()`.
     /// (Fails before `duck_mut` exists — the engine would be effectively write-only.)
-    #[cfg(feature = "duckdb")]
     #[test]
     fn session_engine_is_usable_for_analysis() -> Result<(), DropletError> {
         let mut s = Session::new("run-duck-mut")?;

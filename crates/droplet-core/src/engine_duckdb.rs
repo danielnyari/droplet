@@ -1,7 +1,8 @@
 //! The local analyze engine (M1) — DuckDB behind the boundary.
 //!
-//! This whole module compiles ONLY under `--features duckdb` (see `lib.rs`). DuckDB is an
-//! in-process OLAP SQL engine (like SQLite, but column-oriented for analytics): it runs inside
+//! DuckDB is an always-on core dependency (no longer feature-gated), and the `droplet-py` wheel
+//! binds straight to this surface. DuckDB is an in-process OLAP SQL engine (like SQLite, but
+//! column-oriented for analytics): it runs inside
 //! our Rust process — no server, no port, no network. Each `Session` owns one ephemeral
 //! in-memory connection that dies with the process (invariant #3 isolation, invariant #5 never
 //! serialize the engine). The sandbox never sees a `Connection`, only opaque `Dataset` handles
@@ -13,9 +14,11 @@ use duckdb::Connection;
 // majors in the tree produce the infamous `expected RecordBatch, found RecordBatch` (invariant #10).
 use duckdb::arrow::record_batch::RecordBatch;
 
-/// Max rows any tool may move into the sandbox in one result (invariant #6). Load-bearing:
-/// it bounds every `to_rows` the agent ever sees, which keeps snapshots small later (M8).
-pub const MAX_RESULT_ROWS: usize = 1000;
+/// The default cap on how many rows any tool may move into the sandbox in one result
+/// (invariant #6). It bounds every `to_rows` the agent sees, which keeps snapshots small later
+/// (M8). It is now a *default*, not a hard limit: each `DuckEngine` carries its own
+/// `max_result_rows` (see `set_max_result_rows`) so a caller can tune the boundary per session.
+pub const DEFAULT_MAX_RESULT_ROWS: usize = 1000;
 
 /// One run's local analyze engine — a host-side wrapper around a single ephemeral,
 /// in-memory DuckDB connection. Lives behind the boundary (invariant #6): the sandbox
@@ -31,6 +34,9 @@ pub struct DuckEngine {
     /// `ds_0`, `ds_1`, … are unique within a session and never reused — the same trick as
     /// M0's handle `Registry`.
     next_id: u64,
+    /// The per-engine cap on rows crossing the boundary in one `to_rows` (invariant #6).
+    /// Defaults to `DEFAULT_MAX_RESULT_ROWS`; tunable via `set_max_result_rows`.
+    max_result_rows: usize,
 }
 
 impl DuckEngine {
@@ -54,7 +60,22 @@ impl DuckEngine {
              SET autoload_known_extensions=false; \
              SET disabled_filesystems='HTTPFileSystem,S3FileSystem';",
         )?;
-        Ok(Self { conn, next_id: 0 })
+        Ok(Self {
+            conn,
+            next_id: 0,
+            max_result_rows: DEFAULT_MAX_RESULT_ROWS,
+        })
+    }
+
+    /// The current row cap a `to_rows` read-out clamps to (invariant #6).
+    pub fn max_result_rows(&self) -> usize {
+        self.max_result_rows
+    }
+
+    /// Set the per-engine row cap. The `droplet-py` wheel surfaces this as
+    /// `Engine(max_result_rows=...)`; lower it to shrink the boundary crossing for a session.
+    pub fn set_max_result_rows(&mut self, max_result_rows: usize) {
+        self.max_result_rows = max_result_rows;
     }
 
     /// Define a fresh lazy `ds_{n}` view over `select_sql` and return its handle (a `CREATE
@@ -170,14 +191,45 @@ impl DuckEngine {
         Ok(batches)
     }
 
-    /// Move up to `MAX_RESULT_ROWS` rows of a dataset into the caller as Arrow — one of only
+    /// Move up to `self.max_result_rows` rows of a dataset into the caller as Arrow — one of only
     /// two functions allowed to cross the boundary, and it is capped (invariant #6). The SQL
     /// `LIMIT` lets DuckDB stop early (it never materializes more than the cap); `cap_batches`
     /// is a second, code-side guard.
     pub fn to_rows(&self, ds: &Dataset) -> Result<Vec<RecordBatch>, crate::DropletError> {
-        let sql = format!("SELECT * FROM {} LIMIT {}", ds.table(), MAX_RESULT_ROWS);
+        let cap = self.max_result_rows;
+        let sql = format!("SELECT * FROM {} LIMIT {}", ds.table(), cap);
         let batches = self.query_arrow_blocking(&sql)?;
-        Ok(cap_batches(batches, MAX_RESULT_ROWS))
+        Ok(cap_batches(batches, cap))
+    }
+
+    /// Capped read-out as **plain Rust rows** — one `Vec<(column_name, Value)>` per row, in the
+    /// dataset's column order. This is the Arrow-free face of `to_rows`: it lets a caller that
+    /// must not depend on Arrow (the `droplet-py` wheel — invariant #10's "use the `duckdb::arrow`
+    /// re-export, never a top-level arrow dep" trap stays contained here — and, later, M3's Monty
+    /// driver building a `list[dict]` `MontyObject`) read results without naming an Arrow type.
+    /// Same cap as `to_rows` (invariant #6).
+    pub fn to_rows_values(
+        &self,
+        ds: &Dataset,
+    ) -> Result<Vec<Vec<(String, Value)>>, crate::DropletError> {
+        let batches = self.to_rows(ds)?;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let names: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            for r in 0..batch.num_rows() {
+                let mut row = Vec::with_capacity(names.len());
+                for (c, name) in names.iter().enumerate() {
+                    row.push((name.clone(), cell_value(batch.column(c), r)?));
+                }
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 
     /// Pull exactly one numeric value out (e.g. a COUNT or SUM) — the narrowest boundary
@@ -246,6 +298,62 @@ fn cap_batches(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<RecordBatch> {
         remaining -= take;
     }
     out
+}
+
+/// One cell of a capped read-out, as a plain Rust value the boundary can carry without Arrow.
+/// M1 covers the column types the analyze surface actually produces (bools, integers, floats,
+/// strings) and maps SQL `NULL` to `Null`; anything else surfaces a `DropletError::UnsupportedType`
+/// rather than guessing. (The "typed value enum" the `scalar_i64` docs anticipate starts here.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+/// Read a single Arrow cell `(col, row)` into a plain `Value`. Downcasting is keyed on the
+/// column's `DataType`, so each `downcast_ref` is infallible (the type was just matched). Arrow
+/// types stay **inside this module** (via the `duckdb::arrow` re-export) — callers see only `Value`.
+fn cell_value(
+    col: &dyn duckdb::arrow::array::Array,
+    row: usize,
+) -> Result<Value, crate::DropletError> {
+    use duckdb::arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    use duckdb::arrow::datatypes::DataType;
+
+    if col.is_null(row) {
+        return Ok(Value::Null);
+    }
+    // `down::<T>()` downcasts to the concrete array we already matched on, then reads `row`.
+    macro_rules! down {
+        ($ty:ty) => {
+            col.as_any()
+                .downcast_ref::<$ty>()
+                .expect("datatype matched")
+        };
+    }
+    let value = match col.data_type() {
+        DataType::Boolean => Value::Bool(down!(BooleanArray).value(row)),
+        DataType::Int8 => Value::Int(down!(Int8Array).value(row) as i64),
+        DataType::Int16 => Value::Int(down!(Int16Array).value(row) as i64),
+        DataType::Int32 => Value::Int(down!(Int32Array).value(row) as i64),
+        DataType::Int64 => Value::Int(down!(Int64Array).value(row)),
+        DataType::UInt8 => Value::Int(down!(UInt8Array).value(row) as i64),
+        DataType::UInt16 => Value::Int(down!(UInt16Array).value(row) as i64),
+        DataType::UInt32 => Value::Int(down!(UInt32Array).value(row) as i64),
+        DataType::UInt64 => Value::Int(down!(UInt64Array).value(row) as i64),
+        DataType::Float32 => Value::Float(down!(Float32Array).value(row) as f64),
+        DataType::Float64 => Value::Float(down!(Float64Array).value(row)),
+        DataType::Utf8 => Value::Str(down!(StringArray).value(row).to_string()),
+        DataType::LargeUtf8 => Value::Str(down!(LargeStringArray).value(row).to_string()),
+        other => return Err(crate::DropletError::UnsupportedType(format!("{other:?}"))),
+    };
+    Ok(value)
 }
 
 /// An opaque handle to a table living inside the host's DuckDB. The sandbox holds these;
@@ -318,7 +426,26 @@ mod tests {
         let ds = Dataset {
             table: "big".to_string(),
         };
-        assert_eq!(total_rows(&eng.to_rows(&ds)?), MAX_RESULT_ROWS); // clamped to 1000
+        assert_eq!(total_rows(&eng.to_rows(&ds)?), DEFAULT_MAX_RESULT_ROWS); // clamped to 1000
+        Ok(())
+    }
+
+    /// The cap is no longer a hard-coded const: a fresh engine starts at the default, and a caller
+    /// (e.g. the `droplet-py` wheel via `Engine(max_result_rows=...)`) can lower it. (Fails before
+    /// the `max_result_rows` field + setter exist.)
+    #[test]
+    fn result_cap_is_configurable() -> Result<(), crate::DropletError> {
+        let mut eng = DuckEngine::new_in_memory()?;
+        assert_eq!(eng.max_result_rows(), DEFAULT_MAX_RESULT_ROWS); // default preserved
+
+        eng.set_max_result_rows(3);
+        // A 100-row view; with the cap lowered to 3, only 3 rows may cross.
+        eng.conn
+            .execute_batch("CREATE VIEW capped AS SELECT * FROM range(100)")?;
+        let ds = Dataset {
+            table: "capped".to_string(),
+        };
+        assert_eq!(total_rows(&eng.to_rows(&ds)?), 3);
         Ok(())
     }
 
@@ -378,6 +505,53 @@ mod tests {
             got,
             vec![("a".into(), 200), ("b".into(), 290), ("c".into(), 300)]
         );
+        Ok(())
+    }
+
+    /// `to_rows_values` is the Arrow-free, capped read-out the `droplet-py` wheel binds to: it
+    /// turns a `Dataset` into plain `Vec<(column, Value)>` rows so a non-Arrow caller can build a
+    /// `list[dict]` without ever naming an Arrow type. (Fails before `Value` + `to_rows_values`.)
+    #[test]
+    fn to_rows_values_returns_plain_typed_rows() -> Result<(), crate::DropletError> {
+        let mut eng = DuckEngine::new_in_memory()?;
+        let ds = eng.register_parquet(&fixture_path())?;
+        let agg = eng.group_agg(
+            &ds,
+            &["category"],
+            &[("total", "CAST(SUM(amount) AS BIGINT)")],
+        )?;
+
+        let mut got: Vec<(String, i64)> = eng
+            .to_rows_values(&agg)?
+            .iter()
+            .map(|row| {
+                // Each row is the column order of the SELECT: (category VARCHAR, total BIGINT).
+                let cat = match &row[0] {
+                    (name, Value::Str(s)) if name == "category" => s.clone(),
+                    other => panic!("col 0 should be category VARCHAR, got {other:?}"),
+                };
+                let total = match &row[1] {
+                    (name, Value::Int(n)) if name == "total" => *n,
+                    other => panic!("col 1 should be total BIGINT, got {other:?}"),
+                };
+                (cat, total)
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("a".into(), 200), ("b".into(), 290), ("c".into(), 300)]
+        );
+        Ok(())
+    }
+
+    /// The plain read-out honors the same cap as `to_rows` (it is built on top of it).
+    #[test]
+    fn to_rows_values_respects_the_cap() -> Result<(), crate::DropletError> {
+        let mut eng = DuckEngine::new_in_memory()?;
+        eng.set_max_result_rows(2);
+        let ds = eng.register_parquet(&fixture_path())?; // 5 rows
+        assert_eq!(eng.to_rows_values(&ds)?.len(), 2);
         Ok(())
     }
 

@@ -11,11 +11,7 @@ serde.workspace       = true
 async-trait.workspace = true
 tokio.workspace       = true
 monty.workspace       = true
-# Optional: the DuckDB local analyze engine compiles ONLY when the `duckdb` feature is on,
-# so the default `cargo build -p droplet-core` stays fast (no C++ engine build).
-duckdb = { workspace = true, optional = true }
-
-[features]
-# Enabling the `duckdb` feature turns on the optional `duckdb` dependency (the `dep:` prefix
-# disambiguates the feature name from the crate name). This is the opt-in analyze engine.
-duckdb = ["dep:duckdb"]
+# The DuckDB local analyze engine is a core, always-on dependency (no longer feature-gated):
+# every Droplet build carries the engine, and `droplet-py` binds to it directly. The cost is a
+# slow first build (Cargo compiles DuckDB's bundled C++); `Cargo.lock` + CI caching absorb it.
+duckdb.workspace = true

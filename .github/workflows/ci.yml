@@ -17,11 +17,18 @@ jobs:
       # is reused across runs instead of recompiled every time.
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      # DuckDB is now an always-on core dependency, so the workspace steps below exercise the
+      # analyze engine directly — no separate `--features duckdb` pass. First run compiles
+      # bundled DuckDB (~3 min); the rust-cache above makes later runs fast.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
       - run: cargo test --workspace
-      # The DuckDB local analyze engine is behind an opt-in feature, so the default steps above
-      # never exercise it. Cover it explicitly (M1). First run compiles bundled DuckDB (~3 min);
-      # the rust-cache above makes later runs fast.
-      - run: cargo clippy -p droplet-core --all-targets --features duckdb -- -D warnings
-      - run: cargo test -p droplet-core --features duckdb
+      # Build the wheel into a venv and run the minimal Python binding test (the `Engine`
+      # vertical slice over the local-Parquet fixture). Reuses the cargo cache above.
+      - name: Python binding test
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip maturin pytest pyarrow
+          maturin develop --manifest-path crates/droplet-py/Cargo.toml
+          pytest -q crates/droplet-py/python/tests

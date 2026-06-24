@@ -2,9 +2,8 @@
 //!
 //! No `pyo3` here (invariant #8): the Python bridge lives only in `droplet-py`.
 
-// The DuckDB local analyze engine is conditionally compiled: included only when the
-// `duckdb` feature is active, so the default build never pulls in the C++ engine.
-#[cfg(feature = "duckdb")]
+// The DuckDB local analyze engine is a core, always-compiled module — the analyze surface
+// the `droplet-py` wheel binds to. (It used to be feature-gated; it no longer is.)
 pub mod engine_duckdb;
 pub mod registry;
 pub mod sandbox;
@@ -33,12 +32,15 @@ pub enum DropletError {
     #[error("blocking task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
 
-    // The local analyze engine (M1). Feature-gated so the default build never references
-    // `duckdb`. `#[from]` auto-generates From<duckdb::Error>, so a `?` on any duckdb call
-    // inside a `Result<_, DropletError>` fn folds the error in (invariant #10).
-    #[cfg(feature = "duckdb")]
+    // The local analyze engine (M1). `#[from]` auto-generates From<duckdb::Error>, so a `?` on
+    // any duckdb call inside a `Result<_, DropletError>` fn folds the error in (invariant #10).
     #[error("duckdb error: {0}")]
     Duckdb(#[from] duckdb::Error),
+
+    // A column type the capped read-out doesn't yet know how to turn into a plain `Value`
+    // (M1 supports the types the analyze surface produces; the richer typed-value work is later).
+    #[error("unsupported column type: {0}")]
+    UnsupportedType(String),
 }
 
 // Future #[from] variants fold in as engines arrive (invariant #10):

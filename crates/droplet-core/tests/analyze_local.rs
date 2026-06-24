@@ -9,7 +9,6 @@
 //! Values are asserted via `scalar_i64` over filtered sub-views — no Arrow downcasting, no
 //! `duckdb`/`arrow` dependency in this test crate. The Arrow payload of `to_rows` is verified
 //! directly in the engine's unit tests (`group_agg_sums_per_category`, `local_sql_…`).
-#![cfg(feature = "duckdb")]
 
 use droplet_core::engine_duckdb::DuckEngine;
 
