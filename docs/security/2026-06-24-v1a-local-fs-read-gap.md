@@ -82,21 +82,35 @@ slice (it's listed under "deliberately does NOT do" in the V1a plan).
 
 ## 5. Blast radius — what is NOT affected
 
-Verified by the adversarial suite (`crates/droplet-core/src/security_tests.rs`):
+Verified by the adversarial suite (`crates/droplet-core/src/security/`).
+
+> **CORRECTION (2026-06-26):** two rows of the original table below were **wrong**. The adversarial
+> suite (Task 5, `security/writes_ddl.rs`; opus-verified) found that `engine_duckdb.rs::new_view`
+> runs agent SQL via `conn.execute_batch(...)`, which executes **every `;`-delimited statement**. The
+> `CREATE VIEW … AS (<sql>)` wrapper only shape-guards the *first* statement, so a `;`-smuggled second
+> statement is **not** parser-rejected — it executes. This adds **arbitrary local-file WRITE**
+> (`…; COPY (…) TO '<path>'`) and **silent dataset-handle poisoning** (`…; CREATE OR REPLACE VIEW
+> ds_0 …`) to the blast radius, plus smuggled `CREATE TABLE`/`INSTALL`/`LOAD`/`ATTACH`. It stays
+> **local-only** — network egress is still blocked by `disabled_filesystems` (egress suite passes).
+> Full writeup + the agent-triggerable macro-arity host-crash and the latent run_id-traversal finding:
+> [`docs/security/2026-06-25-adversarial-suite-findings.md`](2026-06-25-adversarial-suite-findings.md).
 
 | Vector | Status |
 |---|---|
 | Python OS escape (`import os`/`socket`/`subprocess`, `open`, `eval`, `exec`, `__import__`, env) | **Blocked** (Monty sandbox) |
-| Network egress (`s3://`/`https://` paths, `read_csv`/`read_parquet` over remote) | **Blocked** (no httpfs autoload + filesystems disabled) |
-| File **write** / `COPY … TO` (local or s3) | **Blocked** (not a `SELECT`; parser-rejected) |
-| Extension load / `ATTACH` / `PRAGMA` / `SET` | **Blocked** (not a `SELECT`) |
-| Unbounded result exfiltration in one call | **Bounded** by the row cap (invariant #6) |
+| Network egress (`s3://`/`https://` paths, `read_csv`/`read_parquet` over remote) | **Blocked** (no httpfs autoload + filesystems disabled; holds even for `;`-smuggled `COPY … TO 's3://…'`) |
+| File **write** / `COPY … TO` — *bare / single-statement* | **Blocked** (not a `SELECT`; parser-rejected) |
+| File **write** / `COPY … TO '<local path>'` — *`;`-smuggled 2nd statement* | **NOT blocked — `execute_batch` runs it → arbitrary local write (2026-06-26 finding)** |
+| Extension load / `ATTACH` / `PRAGMA` / `SET` — *bare* | **Blocked** (not a `SELECT`) |
+| Extension load / `ATTACH` / `CREATE TABLE` — *`;`-smuggled 2nd statement* | **NOT blocked — executes locally (2026-06-26 finding); `SET enable_external_access`/`disabled_filesystems` still blocked by the runtime latch** |
+| Dataset-handle integrity (`…; CREATE OR REPLACE VIEW ds_0`) | **NOT blocked — silent wrong-data poisoning (2026-06-26 finding)** |
+| Unbounded result exfiltration in one call | **Bounded** by the row cap (invariant #6) — but the cap is row-count only (blind to row width, cell byte-size, and the `run_code` return value; 2026-06-26 finding) |
 | Calling an unregistered host function | **Errors**, session survives |
 | **Local file read / dir enumeration** | **NOT blocked — this gap** |
 
-The containment means the agent can *read* host files but cannot *send* them anywhere directly; the
-leak is via the returned tool result. Still a breach, but the blast radius is "read, then return,"
-not "read, then POST to attacker."
+The agent can now *read AND write* host files locally (read via `read_csv`/`read_blob`/`glob`, write
+via `;`-smuggled `COPY … TO`), but still cannot *send* them anywhere directly — network egress stays
+blocked. Blast radius: "read/write local, then return," not "read, then POST to attacker."
 
 ## 6. Detection
 

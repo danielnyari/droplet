@@ -22,7 +22,12 @@ jobs:
       # bundled DuckDB (~3 min); the rust-cache above makes later runs fast.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
-      - run: cargo test --workspace
+      # RUST_MIN_STACK: belt-and-suspenders for the adversarial recursion canaries. They already run on a
+      # 16 MiB `run_big_stack` thread (security/dos_limits.rs, memory_safety.rs), but a larger default stack
+      # protects any debug-build deep-recursion path from a native stack overflow (monty's depth-1000 cap can
+      # overflow the default stack in debug). The `#[ignore]`d DoS watchdog canaries are NOT run here (they
+      # spin ~3s each by design); run them manually with `cargo test -- --ignored`.
+      - run: RUST_MIN_STACK=16777216 cargo test --workspace
       # Build the wheel into a venv and run the minimal Python binding test (the `Engine`
       # vertical slice over the local-Parquet fixture). Reuses the cargo cache above.
       - name: Python binding test
