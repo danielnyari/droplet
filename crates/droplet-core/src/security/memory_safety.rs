@@ -39,7 +39,7 @@ fn sort_key_drops_last_external_ref_to_sorted_list() {
 }
 
 /// `HOLDS` — Directly exercises the cycle collector: each iteration creates an unreachable a<->b reference cycle that pure refcounting cannot free, forcing collect_cycles to run repeatedly. Distinct mechanism from all sort/iterator/drop tests.
-/// seam: monty heap.rs Bacon-Rajan trial-deletion cycle collector, driven by churning unreachable a<->b cycles under session.rs's NoLimitTracker (resource.rs)
+/// seam: monty heap.rs Bacon-Rajan trial-deletion cycle collector, driven by churning unreachable a<->b cycles under the session's LimitedTracker (resource.rs)
 #[test]
 fn reference_cycle_storm_triggers_cycle_collector() {
     let code = "for i in range(2000):\n    a = []\n    b = [a]\n    a.append(b)\n    a = None\n    b = None\n'done'";
@@ -136,43 +136,45 @@ fn exception_stored_in_container_then_reraised() {
     assert!(matches!(&r, Ok(MontyObject::String(s)) if s.contains("payload-XYZ")) || matches!(&r, Err(DropletError::Monty(_))), "an exception stored in a container, surviving the container's drop, then re-raised must carry its original payload (no UAF on the exception's message buffer); got {r:?}");
 }
 
-/// `CANARY` — Pins the accepted gap that Session's NoLimitTracker neuters the pow size pre-check — the 2**10_000_000 family. Bounded to 2**200000 so the test runs; the magnitude is the canary marker. Distinct allocator path from container repeat.
-/// seam: monty pow + resource.rs check_pow_size, which is neutered because session.rs:59 hardcodes NoLimitTracker (check_large_result is unconditional Ok). The 2**N pre-alloc accepted gap.
+/// `CANARY` — Pins that `2**200000` returns Ok under the session's LimitedTracker (max_memory 256 MiB). Bounded to 2**200000 so the test runs in reasonable time; the magnitude is the canary marker. Distinct allocator path from container repeat.
+/// seam: monty pow + resource.rs check_pow_size -> check_large_result, which runs under the session's LimitedTracker and compares the estimated peak against the 256 MiB budget.
+/// Why Ok: the estimated peak for 2**200000 (~few KB BigInt) fits well under 256 MiB, so check_large_result passes. Catching this class would need a much lower max_memory OR an explicit absolute pow-bit ceiling independent of the memory budget.
 #[test]
-fn huge_int_pow_preallocation_under_nolimit_tracker() {
+fn huge_int_pow_preallocation_under_session_memory_budget() {
     let code = "x = 2 ** 200000\nx % 7";
     let r = Session::new("ms-hugeint").unwrap().run_code(code);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "CANARY: 2**200000 actually allocates the BigInt because NoLimitTracker disables check_pow_size's size gate; at this BOUNDED magnitude it must still complete or surface a contained error (documenting the absent allocation ceiling). got {r:?}");
+    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "CANARY: 2**200000 allocates the BigInt because its estimated peak fits under the 256 MiB LimitedTracker budget; at this bounded magnitude it must complete or surface a contained error (documenting the absent absolute pow-bit ceiling). got {r:?}");
 }
 
-/// `CANARY` (converted from LIMIT) — FINDING: under the current NoLimitTracker, 2**10_000_000
-/// actually allocates without hitting check_pow_size. This pins the OBSERVED behavior (Ok) so
-/// the suite stays green. The DESIRED behavior (contained MemoryError + session survival) will be
-/// enforced once `session.rs` is wired with LimitedTracker — at that point this test flips red and
-/// must be reverted to the LIMIT form. Document: this is the headline gap driving the limiter wiring.
-/// seam: session.rs:58 '// SWAP: LimitedTracker for prod'; NoLimitTracker disables check_pow_size
-/// entirely, so 2**10_000_000 allocates a ~375 KB BigInt unconditionally.
+/// `CANARY` — Pins that `2**10_000_000` returns Ok under the session's LimitedTracker (max_memory 256 MiB, in place since Task 2).
+/// Session uses LimitedTracker; check_pow_size -> check_large_result DOES run and compares the estimated peak against the 256 MiB budget.
+/// Why Ok: 2**10_000_000 produces a ~1.25 MB BigInt; with monty's 4× repeated-squaring safety factor the estimated peak is ~10 MB, which fits under 256 MiB — the gate runs and correctly passes.
+/// Catching this class would need a much lower max_memory OR an explicit absolute pow-bit ceiling independent of the memory budget.
+/// seam: monty pow + resource.rs check_pow_size -> check_large_result under LimitedTracker (session.rs builds with max_allocations(5_000_000) + max_memory(256 MiB)).
 #[test]
 fn huge_int_pow_must_be_bounded_under_limited_tracker() {
     let mut s = Session::new("ms-hugeint-limit").unwrap();
     let r = s.run_code("2 ** 10000000");
-    // CANARY: TODAY this is Ok(BigInt(...)) because NoLimitTracker is wired. When LimitedTracker
-    // lands this must flip to Err(DropletError::Monty(_)) + session-survives. Flip it then.
+    // CANARY: 2**10_000_000 is Ok(BigInt(...)) because its ~10 MB estimated peak fits under the
+    // 256 MiB LimitedTracker budget. Catching this would need a lower budget or an absolute
+    // pow-bit ceiling. Session must survive either way.
     assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
-        "CANARY/FINDING: 2**10_000_000 must resolve to a value (current NoLimitTracker behavior, gap) \
-        or a contained MemoryError (desired LimitedTracker behavior); never panic/UAF; got {r:?}");
+        "CANARY: 2**10_000_000 resolves to a value because its estimated peak (~10 MB) fits under \
+        the 256 MiB LimitedTracker budget; or a contained MemoryError if budget is later tightened; \
+        never panic/UAF; got {r:?}");
     let survive = s.run_code("1 + 1");
     assert!(matches!(survive, Ok(MontyObject::Int(2))),
-        "the session REPL must survive regardless of tracker; got {survive:?}");
+        "the session REPL must survive; got {survive:?}");
 }
 
-/// `CANARY` — Different allocator path than int pow (sequence repeat via check_repeat_size, building a 500k-element heap Vec) — pins that the SAME NoLimit gap applies to container pre-allocation, not just bignums.
-/// seam: monty list repeat (`[x]*N`) -> resource.rs check_repeat_size against NoLimitTracker (unconditional Ok) — a DISTINCT allocator path (sequence repeat building a heap Vec of Values) from int pow
+/// `CANARY` — Different allocator path than int pow (sequence repeat via check_repeat_size, building a 500k-element heap Vec) — pins that the same budget-fit behavior applies to container pre-allocation, not just bignums.
+/// seam: monty list repeat (`[x]*N`) -> resource.rs check_repeat_size -> check_large_result under LimitedTracker (256 MiB budget) — a DISTINCT allocator path (sequence repeat building a heap Vec of Values) from int pow.
+/// Why Ok: `[0]*500000` allocates a ~few MB Vec of Values, which fits under the 256 MiB LimitedTracker budget — check_repeat_size runs and correctly passes. Catching this class would need a much lower max_memory OR an explicit absolute repeat-count ceiling independent of the memory budget.
 #[test]
 fn list_repeat_huge_count_preallocation() {
     let code = "L = [0] * 500000\nlen(L)";
     let r = Session::new("ms-listrepeat").unwrap().run_code(code);
-    assert!(matches!(&r, Ok(MontyObject::Int(n)) if *n == 500000) || matches!(&r, Err(DropletError::Monty(_))), "CANARY: [0]*500000 actually allocates the 500k-element list because check_repeat_size's gate is disabled under NoLimitTracker; at this bounded count it must complete (len==500000) or surface a contained error; got {r:?}");
+    assert!(matches!(&r, Ok(MontyObject::Int(n)) if *n == 500000) || matches!(&r, Err(DropletError::Monty(_))), "CANARY: [0]*500000 allocates the 500k-element list because its estimated size fits under the 256 MiB LimitedTracker budget; check_repeat_size runs and correctly passes; at this bounded count it must complete (len==500000) or surface a contained error; got {r:?}");
 }
 
 /// `HOLDS` — The one Hack-Monty multi-hop gadget entirely absent from the suite: finalizer resurrection (object re-inserts itself during collection, defeating the refcount==0 free assumption). Even if Monty has no user __del__ support, the contract is a clean contained error, never a crash. Distinct from every cycle/UAF/iterator angle. If Monty lacks __del__ it folds to a contained Monty error and HOLDS trivially; if it supports finalizers it stresses the resurrection path. Either way no crash is the contract.
