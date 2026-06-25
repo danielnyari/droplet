@@ -122,12 +122,47 @@ mod tests {
     /// seam: engine_duckdb.rs new_view execute_batch; a ';'-smuggled CREATE OR REPLACE VIEW ds_0 rewrites the view an EARLIER handle resolves to (handle-content poisoning / data integrity).
     #[test]
     fn known_gap_create_or_replace_view_semicolon_poisons_existing_handle() {
-        let dir = tmp_dir("wddl-corv-semi"); let p = sales_parquet(&dir); let mut s = Session::new("wddl-corv-semi").unwrap(); s.run_code(&format!("ds = register({p:?})")).unwrap(); /* ds is ds_0 */ let r = s.run_code("local_sql('SELECT 1 AS x; CREATE OR REPLACE VIEW ds_0 AS SELECT 99 AS region, 99.0 AS amt', [])"); let _poisoned = s.run_code("to_rows(ds)"); let _ = std::fs::remove_dir_all(&dir);
+        let dir = tmp_dir("wd-poison"); let p = sales_parquet(&dir); let mut s = Session::new("wd-poison").unwrap();
+        s.run_code(&format!("ds = register({p:?})")).unwrap();      // ds -> handle 0 -> view ds_0
+        let before = s.run_code("to_rows(ds)").unwrap();             // baseline (region 'EU', amt 1.0)
+        // ;-smuggle a CREATE OR REPLACE VIEW ds_0 (deterministic engine view name) with attacker rows:
+        let evil = "local_sql('SELECT 1 AS x; CREATE OR REPLACE VIEW ds_0 AS SELECT 99 AS region, CAST(1234.0 AS DOUBLE) AS amt', [])";
+        let r = s.run_code(evil);
         // FINDING: ';' breakout IS real — handle-content poisoning confirmed. Assert observed (bad) behavior.
-        assert!(r.is_ok(), "CANARY: currently r.is_ok() (smuggled CREATE OR REPLACE VIEW executes, poisoning handle) — flip to is_err() when fixed");
+        assert!(r.is_ok(), "CANARY: currently r.is_ok() (smuggled CREATE OR REPLACE VIEW executes, poisoning handle) — flip to is_err() when fixed; got {r:?}");
+        let after = s.run_code("to_rows(ds)").unwrap();              // SAME handle, now poisoned
+        let before_s = format!("{before:?}");
+        let after_s = format!("{after:?}");
+        assert_ne!(before_s, after_s, "KNOWN GAP: the handle's data changed silently");
+        assert!(after_s.contains("99") && after_s.contains("1234"), "KNOWN GAP: handle now returns ATTACKER rows: {after_s}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `PROBE` — Boundary/anti-regression canary for the eventual single-statement fix: ensures the remediation distinguishes an empty trailing statement (benign) from a smuggled one (malicious). Distinct purpose from every breakout test.
+    /// `CANARY` — FINDING (HIGH, new): the query() CREATE VIEW wrapper does NOT block a ;-smuggled COPY TO,
+    /// so an agent can WRITE attacker content to an arbitrary host path (engine_duckdb.rs::new_view uses
+    /// execute_batch, running every ;-delimited statement). Local-only (no network egress). Flip to assert
+    /// the write is BLOCKED when new_view enforces single-statement execution.
+    #[test]
+    fn known_gap_multistatement_copy_to_writes_arbitrary_local_file() {
+        let dir = tmp_dir("wd-copywrite");
+        let p = sales_parquet(&dir);
+        // Target OUTSIDE the session work_dir, proving arbitrary-path write:
+        let target = dir.join("exfil_PWNED.csv");
+        let target_s = target.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&target);
+        let mut s = Session::new("wd-copywrite").unwrap();
+        let code = format!(
+            "query({p:?}, \"SELECT * FROM data; COPY (SELECT 'PWNED' AS marker) TO '{target_s}' (FORMAT CSV)\")"
+        );
+        let r = s.run_code(&code);
+        assert!(r.is_ok(), "KNOWN GAP: ;-smuggled COPY TO executes via execute_batch; got {r:?}");
+        assert!(target.exists(), "KNOWN GAP: arbitrary local-file WRITE — the COPY created a host file");
+        let contents = std::fs::read_to_string(&target).unwrap_or_default();
+        assert!(contents.contains("PWNED"), "the written file holds attacker content: {contents:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `HOLDS` — Boundary/anti-regression canary for the eventual single-statement fix: ensures the remediation distinguishes an empty trailing statement (benign) from a smuggled one (malicious). Distinct purpose from every breakout test.
     /// seam: engine_duckdb.rs new_view execute_batch; a harmless trailing ';' (empty 2nd statement) must NOT be conflated with a real 2nd statement when the single-statement fix lands.
     #[test]
     fn trailing_semicolon_only_is_benign_not_a_breakout() {
