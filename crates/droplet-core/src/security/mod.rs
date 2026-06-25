@@ -18,6 +18,7 @@ use crate::tool::{Tool, ToolCx};
 mod exfiltration;
 mod dos_limits;
 mod sandbox_escape;
+mod egress;
 
 /// A unique temp dir per tag so fixtures never collide.
 pub(crate) fn tmp_dir(tag: &str) -> std::path::PathBuf {
