@@ -1,13 +1,13 @@
 // crates/droplet-core/src/security/result_cap.rs
 //! Result-cap / boundary-volume (invariant #6) — adversarial angles. seam: `engine_duckdb.rs` row cap + `run_code`'s uncapped final return value.
 #![allow(unused_imports)]
-use monty::MontyObject;
+use super::{catch_dispatch, dispatch, list_len, sales_parquet, tmp_dir, write_parquet};
 use crate::DropletError;
-use crate::session::Session;
-use crate::engine_duckdb::{DuckEngine, Dataset, DEFAULT_MAX_RESULT_ROWS};
+use crate::engine_duckdb::{DEFAULT_MAX_RESULT_ROWS, Dataset, DuckEngine};
 use crate::registry::Registry;
+use crate::session::Session;
 use crate::tool::{Tool, ToolCx};
-use super::{dispatch, catch_dispatch, tmp_dir, sales_parquet, write_parquet, list_len};
+use monty::MontyObject;
 
 /// `HOLDS` — Cap on the pure handle/to_rows value-move seam where rows never touch a parquet file (distinct from the register_parquet/query path).
 /// seam: engine_duckdb.rs to_rows LIMIT clamp + cap_batches over a pure handle; tools.rs to_rows/local_sql; session.rs run_code suspend/resume
@@ -15,8 +15,14 @@ use super::{dispatch, catch_dispatch, tmp_dir, sales_parquet, write_parquet, lis
 fn cap_holds_via_to_rows_handle_path_2500_to_1000() {
     let mut s = Session::new("rc-torows-2500").unwrap();
     // 2500-row dataset built entirely as a HANDLE (range view, no parquet file), then crossed via to_rows.
-    let out = s.run_code("to_rows(local_sql('SELECT * FROM range(2500)', []))").unwrap();
-    assert_eq!(list_len(&out), DEFAULT_MAX_RESULT_ROWS, "to_rows() over a pure handle must clamp 2500 -> 1000 just like query()"); // expected: 1000
+    let out = s
+        .run_code("to_rows(local_sql('SELECT * FROM range(2500)', []))")
+        .unwrap();
+    assert_eq!(
+        list_len(&out),
+        DEFAULT_MAX_RESULT_ROWS,
+        "to_rows() over a pure handle must clamp 2500 -> 1000 just like query()"
+    ); // expected: 1000
 }
 
 /// `HOLDS` — Boundary arithmetic: probes the precise off-by-one at the cap edge (LIMIT 1000 vs the cap_batches .min()), a mechanism a bulk 2500-row test cannot expose.
@@ -26,9 +32,15 @@ fn cap_off_by_one_boundary_1001_clamps_to_1000() {
     let dir = tmp_dir("rc-offbyone");
     let p = sales_parquet(&dir);
     let mut s = Session::new("rc-offbyone").unwrap();
-    let out = s.run_code(&format!("query({p:?}, 'SELECT * FROM range(1001)')")).unwrap();
+    let out = s
+        .run_code(&format!("query({p:?}, 'SELECT * FROM range(1001)')"))
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(list_len(&out), DEFAULT_MAX_RESULT_ROWS, "cap+1 rows must clamp to exactly the cap, never let one extra row through"); // expected: 1000 not 1001
+    assert_eq!(
+        list_len(&out),
+        DEFAULT_MAX_RESULT_ROWS,
+        "cap+1 rows must clamp to exactly the cap, never let one extra row through"
+    ); // expected: 1000 not 1001
 }
 
 /// `CANARY` (PROBE→CANARY conversion) — FINDING: result cap is row-count only; a 1-row x 10000-column result crosses fully.
@@ -40,15 +52,31 @@ fn known_gap_cap_is_on_rows_not_cells_wide_row_crosses_fully() {
     let dir = tmp_dir("rc-wide");
     let p = sales_parquet(&dir);
     let mut s = Session::new("rc-wide").unwrap();
-    let cols = (0..10000).map(|i| format!("{i} AS c{i}")).collect::<Vec<_>>().join(", ");
-    let out = s.run_code(&format!("query({p:?}, 'SELECT {cols}')")).unwrap();
+    let cols = (0..10000)
+        .map(|i| format!("{i} AS c{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let out = s
+        .run_code(&format!("query({p:?}, 'SELECT {cols}')"))
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     // FINDING: wide row bypasses the row-count cap; 10000 columns cross whole.
-    assert_eq!(list_len(&out), 1, "one row crosses (unbounded column width)");
-    let MontyObject::List(items) = &out else { panic!("expected list") };
-    let MontyObject::Dict(pairs) = &items[0] else { panic!("expected dict row") };
+    assert_eq!(
+        list_len(&out),
+        1,
+        "one row crosses (unbounded column width)"
+    );
+    let MontyObject::List(items) = &out else {
+        panic!("expected list")
+    };
+    let MontyObject::Dict(pairs) = &items[0] else {
+        panic!("expected dict row")
+    };
     let ncols = pairs.clone().into_iter().count();
-    assert_eq!(ncols, 10000, "CANARY: 10000 columns cross; column-count cap not enforced (invariant #6 gap)");
+    assert_eq!(
+        ncols, 10000,
+        "CANARY: 10000 columns cross; column-count cap not enforced (invariant #6 gap)"
+    );
 }
 
 /// `CANARY` (PROBE→CANARY conversion) — FINDING: result cap bounds row COUNT but not per-cell BYTE size.
@@ -61,14 +89,29 @@ fn known_gap_cap_does_not_bound_per_cell_byte_size() {
     let p = sales_parquet(&dir);
     let mut s = Session::new("rc-bigstr").unwrap();
     // One row, one column, but the single cell is a ~50MB string built in SQL via repeat().
-    let out = s.run_code(&format!("query({p:?}, \"SELECT repeat('x', 50000000) AS big\")")).unwrap();
+    let out = s
+        .run_code(&format!(
+            "query({p:?}, \"SELECT repeat('x', 50000000) AS big\")"
+        ))
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    let MontyObject::List(items) = &out else { panic!("expected list") };
-    let MontyObject::Dict(pairs) = &items[0] else { panic!("expected dict") };
+    let MontyObject::List(items) = &out else {
+        panic!("expected list")
+    };
+    let MontyObject::Dict(pairs) = &items[0] else {
+        panic!("expected dict")
+    };
     let mut cell_len = 0usize;
-    for (_k, v) in pairs.clone().into_iter() { if let MontyObject::String(big) = v { cell_len = big.len(); } }
+    for (_k, v) in pairs.clone().into_iter() {
+        if let MontyObject::String(big) = v {
+            cell_len = big.len();
+        }
+    }
     // FINDING: 50MB cell crosses; per-cell byte cap not enforced.
-    assert_eq!(cell_len, 50_000_000, "CANARY: a 50MB cell crosses whole; per-cell byte size is unbounded (invariant #6 gap)");
+    assert_eq!(
+        cell_len, 50_000_000,
+        "CANARY: a 50MB cell crosses whole; per-cell byte size is unbounded (invariant #6 gap)"
+    );
 }
 
 /// `CANARY` (PROBE→CANARY conversion) — FINDING: run_code's final return value is uncapped.
@@ -82,7 +125,11 @@ fn known_gap_cap_does_not_bound_agent_built_final_return_value() {
     // The agent fabricates a giant list in its OWN Monty code (no tool, no engine) and returns it.
     let out = s.run_code("[0]*1000000").unwrap();
     // FINDING: 1_000_000-element list crosses; run_code return-value cap not enforced.
-    assert_eq!(list_len(&out), 1_000_000, "CANARY: agent-built list of 1M elements crosses run_code boundary whole; run_code return-value is uncapped (invariant #6 gap — different seam from engine cap)");
+    assert_eq!(
+        list_len(&out),
+        1_000_000,
+        "CANARY: agent-built list of 1M elements crosses run_code boundary whole; run_code return-value is uncapped (invariant #6 gap — different seam from engine cap)"
+    );
 }
 
 /// `HOLDS` — Numeric boundary correctness: a scalar read-out that overflows i64 must fail loudly, not silently truncate a value crossing the boundary.
@@ -93,9 +140,16 @@ fn scalar_i64_addition_overflow_surfaces_err_not_silent() {
     let p = sales_parquet(&dir);
     let mut s = Session::new("rc-scalovf").unwrap();
     // Addition of two INT64-max literals overflows INT64 inside DuckDB.
-    let err = s.run_code(&format!("scalar(register({p:?}), '9223372036854775807 + 9223372036854775807')")).unwrap_err();
+    let err = s
+        .run_code(&format!(
+            "scalar(register({p:?}), '9223372036854775807 + 9223372036854775807')"
+        ))
+        .unwrap_err();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(matches!(err, DropletError::Duckdb(_)), "i64 overflow in scalar() must surface a contained DuckDB error, never wrap/truncate silently; got {err:?}"); // expected: Err(Duckdb(... Out of Range ...))
+    assert!(
+        matches!(err, DropletError::Duckdb(_)),
+        "i64 overflow in scalar() must surface a contained DuckDB error, never wrap/truncate silently; got {err:?}"
+    ); // expected: Err(Duckdb(... Out of Range ...))
 }
 
 /// `HOLDS` — Distinct from the addition-overflow angle: here the overflow is in the i128->i64 narrowing CAST (scalar_i64's load-bearing cast), a different DuckDB code path (Conversion vs Out-of-Range).
@@ -106,9 +160,16 @@ fn scalar_hugeint_to_i64_cast_overflow_surfaces_err() {
     let p = sales_parquet(&dir);
     let mut s = Session::new("rc-hugecast").unwrap();
     // A HUGEINT value just past i64::MAX; the scalar_i64 BIGINT cast must reject it, not wrap to negative.
-    let err = s.run_code(&format!("scalar(register({p:?}), 'CAST(9223372036854775808::HUGEINT AS BIGINT)')")).unwrap_err();
+    let err = s
+        .run_code(&format!(
+            "scalar(register({p:?}), 'CAST(9223372036854775808::HUGEINT AS BIGINT)')"
+        ))
+        .unwrap_err();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(matches!(err, DropletError::Duckdb(_)), "HUGEINT(i128) exceeding i64 must fail the BIGINT cast in scalar(), not silently wrap; got {err:?}"); // expected: Err(Duckdb(... Conversion Error ... out of range for ... INT64 ...))
+    assert!(
+        matches!(err, DropletError::Duckdb(_)),
+        "HUGEINT(i128) exceeding i64 must fail the BIGINT cast in scalar(), not silently wrap; got {err:?}"
+    ); // expected: Err(Duckdb(... Conversion Error ... out of range for ... INT64 ...))
 }
 
 /// `HOLDS` — Type-confusion at the value-move boundary: an out-of-vocabulary cell type must be a clean Err, not reach the infallible-by-assumption down!() .expect() downcast.
@@ -117,9 +178,14 @@ fn scalar_hugeint_to_i64_cast_overflow_surfaces_err() {
 fn hugeint_column_via_to_rows_is_unsupported_type_not_panic() {
     let mut s = Session::new("rc-hugecol").unwrap();
     // A HUGEINT (Arrow Decimal128) column read via to_rows: cell_value has no Decimal128 arm.
-    let res = s.run_code("to_rows(local_sql('SELECT 170141183460469231731687303715884105727::HUGEINT AS h', []))");
+    let res = s.run_code(
+        "to_rows(local_sql('SELECT 170141183460469231731687303715884105727::HUGEINT AS h', []))",
+    );
     let err = res.unwrap_err();
-    assert!(matches!(err, DropletError::UnsupportedType(_)), "a HUGEINT/Decimal128 result column must surface a contained UnsupportedType at the read-out, never a downcast panic or garbage; got {err:?}"); // expected: Err(UnsupportedType("Decimal128(38, 0)"))
+    assert!(
+        matches!(err, DropletError::UnsupportedType(_)),
+        "a HUGEINT/Decimal128 result column must surface a contained UnsupportedType at the read-out, never a downcast panic or garbage; got {err:?}"
+    ); // expected: Err(UnsupportedType("Decimal128(38, 0)"))
 }
 
 /// `HOLDS` — Boundary-correctness sibling of the cap: a degenerate single-value crossing (NULL) must fail loudly so a zero-row analysis can't masquerade as a real 0 — a different seam (query_row NULL decode) than overflow.
@@ -130,9 +196,16 @@ fn empty_aggregate_null_scalar_surfaces_err_not_silent_zero() {
     let p = sales_parquet(&dir);
     let mut s = Session::new("rc-nullscal").unwrap();
     // Filter matches nothing, so SUM(amt) is NULL; scalar() must NOT silently coerce NULL to 0.
-    let err = s.run_code(&format!("scalar(filter_rows(register({p:?}), 'amt > 1e9'), 'SUM(amt)')")).unwrap_err();
+    let err = s
+        .run_code(&format!(
+            "scalar(filter_rows(register({p:?}), 'amt > 1e9'), 'SUM(amt)')"
+        ))
+        .unwrap_err();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(matches!(err, DropletError::Duckdb(_)), "a NULL aggregate (empty group) must surface a contained engine error, not silently cross as 0/garbage; got {err:?}"); // expected: Err(Duckdb(InvalidColumnType(.. Null)))
+    assert!(
+        matches!(err, DropletError::Duckdb(_)),
+        "a NULL aggregate (empty group) must surface a contained engine error, not silently cross as 0/garbage; got {err:?}"
+    ); // expected: Err(Duckdb(InvalidColumnType(.. Null)))
 }
 
 /// `HOLDS` — The cap is a PER-SESSION configurable field, not a global const; verifies the default is 1000 AND that lowering it is actually honored on the value-move path.
@@ -149,7 +222,10 @@ fn lowered_per_session_cap_is_honored_on_readout() {
     let ds = eng.register_parquet(&big).unwrap();
     let n: usize = eng.to_rows(&ds).unwrap().iter().map(|b| b.num_rows()).sum();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(n, 2, "a lowered per-session cap (2) must clamp every read-out; the default (1000) must be the starting value"); // expected: 2 rows out of 100
+    assert_eq!(
+        n, 2,
+        "a lowered per-session cap (2) must clamp every read-out; the default (1000) must be the starting value"
+    ); // expected: 2 rows out of 100
 }
 
 /// `PROBE` — Pre-allocation / huge-int bomb reached purely through the run_code value path (no engine). Verifies Droplet contains a Monty bignum blowup as Ok-or-Err, never a panic across the boundary.
@@ -161,7 +237,16 @@ fn huge_int_literal_construction_does_not_panic_session() {
     let res = s.run_code("2**100000");
     // CONTRACT (Droplet's surface, not Monty internals): reached through run_code it must NOT panic/UAF; it must surface a contained DropletError OR a correct MontyObject. Ok or Err both acceptable; a crash is not.
     match res {
-      Ok(v) => assert!(matches!(v, MontyObject::BigInt(_) | MontyObject::Int(_)), "huge int must come back as a (Big)Int, got {v:?}"),
-      Err(e) => assert!(matches!(e, DropletError::Monty(_) | DropletError::Duckdb(_) | DropletError::BadArg(_)), "huge int must fail as a contained DropletError, got {e:?}"),
+        Ok(v) => assert!(
+            matches!(v, MontyObject::BigInt(_) | MontyObject::Int(_)),
+            "huge int must come back as a (Big)Int, got {v:?}"
+        ),
+        Err(e) => assert!(
+            matches!(
+                e,
+                DropletError::Monty(_) | DropletError::Duckdb(_) | DropletError::BadArg(_)
+            ),
+            "huge int must fail as a contained DropletError, got {e:?}"
+        ),
     }
 }

@@ -15,17 +15,17 @@ use crate::registry::Registry;
 use crate::session::Session;
 use crate::tool::{Tool, ToolCx};
 
-mod exfiltration;
 mod dos_limits;
-mod sandbox_escape;
 mod egress;
-mod writes_ddl;
-mod sql_injection;
-mod handles_args;
-mod result_cap;
 mod error_safety;
-mod memory_safety;
+mod exfiltration;
+mod handles_args;
 mod isolation;
+mod memory_safety;
+mod result_cap;
+mod sandbox_escape;
+mod sql_injection;
+mod writes_ddl;
 
 /// A unique temp dir per tag so fixtures never collide.
 pub(crate) fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -64,7 +64,10 @@ pub(crate) fn dispatch(name: &str, args: &[MontyObject]) -> Result<MontyObject, 
         .unwrap_or_else(|| panic!("tool {name} must be registered"));
     let mut engine = DuckEngine::new_in_memory().unwrap();
     let mut handles = Registry::new();
-    let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
+    let mut cx = ToolCx {
+        engine: &mut engine,
+        handles: &mut handles,
+    };
     (tool.dispatch)(&mut cx, args, &[])
 }
 
@@ -92,7 +95,10 @@ pub(crate) fn catch_dispatch_kw(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let mut engine = DuckEngine::new_in_memory().unwrap();
         let mut handles = Registry::new();
-        let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
+        let mut cx = ToolCx {
+            engine: &mut engine,
+            handles: &mut handles,
+        };
         (tool.dispatch)(&mut cx, &args_owned, &kwargs_owned)
     }))
 }

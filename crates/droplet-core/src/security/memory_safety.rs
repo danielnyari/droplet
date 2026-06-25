@@ -3,13 +3,13 @@
 //! seam: monty GC + `list.sort(key=)` re-entrancy + cycles + type confusion,
 //! reached through `run_code`.
 #![allow(unused_imports)]
-use monty::MontyObject;
+use super::{catch_dispatch, dispatch, list_len, sales_parquet, tmp_dir, write_parquet};
 use crate::DropletError;
-use crate::session::Session;
-use crate::engine_duckdb::{DuckEngine, Dataset, DEFAULT_MAX_RESULT_ROWS};
+use crate::engine_duckdb::{DEFAULT_MAX_RESULT_ROWS, Dataset, DuckEngine};
 use crate::registry::Registry;
+use crate::session::Session;
 use crate::tool::{Tool, ToolCx};
-use super::{dispatch, catch_dispatch, tmp_dir, sales_parquet, write_parquet, list_len};
+use monty::MontyObject;
 
 /// `HOLDS` — Attacks do_list_sort's mem::take detach + post-swap 'list modified during sort' guard — the exact CPython-style hardening against sort-key UAF. No other test grows the live list from inside the comparator.
 /// seam: monty types/list.rs do_list_sort (mem::take reentrancy guard) reached via session.rs run_code:98-117 suspend/resume; the headline Hack-Monty sort-key UAF shape
@@ -17,7 +17,10 @@ use super::{dispatch, catch_dispatch, tmp_dir, sales_parquet, write_parquet, lis
 fn sort_key_mutates_list_being_sorted() {
     let code = "L = [3, 1, 2, 5, 4]\ndef k(x):\n    L.append(99)\n    return x\ntry:\n    L.sort(key=k)\n    out = 'no_error'\nexcept ValueError:\n    out = 'caught_value_error'\nexcept Exception:\n    out = 'caught_other'\nout";
     let r = Session::new("ms-sort-mutate").unwrap().run_code(code);
-    assert!(matches!(&r, Ok(MontyObject::String(_))) || matches!(&r, Err(DropletError::Monty(_))), "sort(key) that mutates the live list must terminate as an in-sandbox value (e.g. ValueError caught -> 'caught_value_error', or a guarded 'no_error') or a contained Monty error — NEVER a panic/UAF/segfault; got {r:?}");
+    assert!(
+        matches!(&r, Ok(MontyObject::String(_))) || matches!(&r, Err(DropletError::Monty(_))),
+        "sort(key) that mutates the live list must terminate as an in-sandbox value (e.g. ValueError caught -> 'caught_value_error', or a guarded 'no_error') or a contained Monty error — NEVER a panic/UAF/segfault; got {r:?}"
+    );
 }
 
 /// `HOLDS` — Distinct from append: clear() drops the live list's element refs while the detached buffer is mid-permutation — exercises the drop/refcount path during sort, not length growth.
@@ -26,7 +29,16 @@ fn sort_key_mutates_list_being_sorted() {
 fn sort_key_clears_list_being_sorted() {
     let code = "L = [3, 1, 2, 5, 4, 6, 7]\nseen = []\ndef k(x):\n    seen.append(x)\n    if len(seen) == 1:\n        L.clear()\n    return x\ntry:\n    L.sort(key=k)\n    out = ('ok', len(L))\nexcept Exception:\n    out = ('exc', len(L))\nout";
     let r = Session::new("ms-sort-clear").unwrap().run_code(code);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "clear() of the list mid-sort must resolve to a value or a contained Monty error, never panic/UAF; got {r:?}"); if let Ok(MontyObject::Tuple(t)) = &r { assert!(matches!(t.get(1), Some(MontyObject::Int(_))), "len(L) must be a valid non-negative int, proving no dangling backing buffer; got {r:?}"); }
+    assert!(
+        r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+        "clear() of the list mid-sort must resolve to a value or a contained Monty error, never panic/UAF; got {r:?}"
+    );
+    if let Ok(MontyObject::Tuple(t)) = &r {
+        assert!(
+            matches!(t.get(1), Some(MontyObject::Int(_))),
+            "len(L) must be a valid non-negative int, proving no dangling backing buffer; got {r:?}"
+        );
+    }
 }
 
 /// `HOLDS` — Targets refcount-vs-stack-ownership: the sort must keep the detached buffer alive via a non-zero refcount while it is owned only on the Rust stack. Setting L=None must not drop it to zero. Distinct from clear (which empties) and append (which grows).
@@ -35,7 +47,10 @@ fn sort_key_clears_list_being_sorted() {
 fn sort_key_drops_last_external_ref_to_sorted_list() {
     let code = "L = [4, 2, 3, 1]\ndef k(x):\n    global L\n    L = None\n    return x\ntry:\n    M = L\n    M.sort(key=k)\n    out = M\nexcept Exception:\n    out = 'exc'\nout";
     let r = Session::new("ms-sort-droplastref").unwrap().run_code(code);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "dropping the last external name binding to the list mid-sort must not free the buffer the sort holds on the Rust stack (UAF); expected sorted list or contained Monty error, got {r:?}");
+    assert!(
+        r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+        "dropping the last external name binding to the list mid-sort must not free the buffer the sort holds on the Rust stack (UAF); expected sorted list or contained Monty error, got {r:?}"
+    );
 }
 
 /// `HOLDS` — Directly exercises the cycle collector: each iteration creates an unreachable a<->b reference cycle that pure refcounting cannot free, forcing collect_cycles to run repeatedly. Distinct mechanism from all sort/iterator/drop tests.
@@ -44,29 +59,89 @@ fn sort_key_drops_last_external_ref_to_sorted_list() {
 fn reference_cycle_storm_triggers_cycle_collector() {
     let code = "for i in range(2000):\n    a = []\n    b = [a]\n    a.append(b)\n    a = None\n    b = None\n'done'";
     let r = Session::new("ms-cycle-storm").unwrap().run_code(code);
-    assert!(matches!(&r, Ok(MontyObject::String(s)) if s == "done") || matches!(r, Err(DropletError::Monty(_))), "churning 2000 self-referential cycles must be reclaimed by the trial-deletion collector with no leak-crash/panic; got {r:?}");
+    assert!(
+        matches!(&r, Ok(MontyObject::String(s)) if s == "done")
+            || matches!(r, Err(DropletError::Monty(_))),
+        "churning 2000 self-referential cycles must be reclaimed by the trial-deletion collector with no leak-crash/panic; got {r:?}"
+    );
 }
 
 /// `HOLDS` — Only angle that crosses the Droplet/Monty boundary mid-builtin via sort: each comparator key triggers a FunctionCall suspension handled by run_code's loop while the sort holds the detached buffer. Distinct re-entry SITE from the map test.
 /// seam: session.rs run_code suspend/resume (FunctionCall arm, lines 105-117) re-entered from inside a Monty sort key callback: sort -> key fn -> FunctionCall suspension -> tool dispatch (register+scalar) -> resume -> next key
 #[test]
 fn reentrant_host_dispatch_from_sort_key_callback() {
-    let dir = std::env::temp_dir().join("droplet-ms-reentrant"); std::fs::create_dir_all(&dir).unwrap(); let p = dir.join("s.parquet"); let pp = p.to_str().unwrap().to_string(); { let conn = duckdb::Connection::open_in_memory().unwrap(); conn.execute_batch(&format!("COPY (SELECT 1 AS v) TO '{pp}' (FORMAT PARQUET)")).unwrap(); }
-    let code = format!("rows = [3, 1, 2]\ndef k(x):\n    h = register({pp:?})\n    return scalar(h, 'COUNT(*)') * x\nrows.sort(key=k)\nrows");
+    let dir = std::env::temp_dir().join("droplet-ms-reentrant");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("s.parquet");
+    let pp = p.to_str().unwrap().to_string();
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!("COPY (SELECT 1 AS v) TO '{pp}' (FORMAT PARQUET)"))
+            .unwrap();
+    }
+    let code = format!(
+        "rows = [3, 1, 2]\ndef k(x):\n    h = register({pp:?})\n    return scalar(h, 'COUNT(*)') * x\nrows.sort(key=k)\nrows"
+    );
     let r = Session::new("ms-reentrant").unwrap().run_code(&code);
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_)) | Err(DropletError::Duckdb(_)) | Err(DropletError::BadHandle(_))), "a host tool call (register+scalar) invoked from inside a sort key — a re-entrant suspend/resume from within a Monty builtin — must complete or surface a contained error, never corrupt suspend/resume state; got {r:?}"); if let Ok(MontyObject::List(items)) = &r { assert_eq!(items.len(), 3, "the sorted list must be intact after re-entrant dispatch; got {r:?}"); }
+    assert!(
+        r.is_ok()
+            || matches!(
+                r,
+                Err(DropletError::Monty(_))
+                    | Err(DropletError::Duckdb(_))
+                    | Err(DropletError::BadHandle(_))
+            ),
+        "a host tool call (register+scalar) invoked from inside a sort key — a re-entrant suspend/resume from within a Monty builtin — must complete or surface a contained error, never corrupt suspend/resume state; got {r:?}"
+    );
+    if let Ok(MontyObject::List(items)) = &r {
+        assert_eq!(
+            items.len(),
+            3,
+            "the sorted list must be intact after re-entrant dispatch; got {r:?}"
+        );
+    }
 }
 
 /// `HOLDS` — map's eager callback loop is a structurally distinct re-entrancy site from sort; each callback mints a fresh handle, stressing the handle registry's monotonic insert (registry.rs insert) under interleaved host dispatch.
 /// seam: monty builtins map() eager evaluate_function re-entering session.rs run_code FunctionCall dispatch per element — a structurally DIFFERENT re-entrancy site than sort; each callback mints a NEW handle via register()
 #[test]
 fn reentrant_host_dispatch_from_map_callback() {
-    let dir = std::env::temp_dir().join("droplet-ms-map-reentrant"); std::fs::create_dir_all(&dir).unwrap(); let p = dir.join("m.parquet"); let pp = p.to_str().unwrap().to_string(); { let conn = duckdb::Connection::open_in_memory().unwrap(); conn.execute_batch(&format!("COPY (SELECT 7 AS v) TO '{pp}' (FORMAT PARQUET)")).unwrap(); }
-    let code = format!("def f(x):\n    return scalar(register({pp:?}), 'SUM(v)') + x\nout = list(map(f, [10, 20, 30]))\nout");
+    let dir = std::env::temp_dir().join("droplet-ms-map-reentrant");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("m.parquet");
+    let pp = p.to_str().unwrap().to_string();
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!("COPY (SELECT 7 AS v) TO '{pp}' (FORMAT PARQUET)"))
+            .unwrap();
+    }
+    let code = format!(
+        "def f(x):\n    return scalar(register({pp:?}), 'SUM(v)') + x\nout = list(map(f, [10, 20, 30]))\nout"
+    );
     let r = Session::new("ms-map-reentrant").unwrap().run_code(&code);
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_)) | Err(DropletError::Duckdb(_)) | Err(DropletError::BadHandle(_))), "host dispatch from inside map() callbacks must complete or surface a contained error; got {r:?}"); if let Ok(MontyObject::List(items)) = &r { assert_eq!(items, &vec![MontyObject::Int(17), MontyObject::Int(27), MontyObject::Int(37)], "map re-entry must produce correct results, proving suspend/resume + handle registry stayed coherent across 3 nested host calls; got {r:?}"); }
+    assert!(
+        r.is_ok()
+            || matches!(
+                r,
+                Err(DropletError::Monty(_))
+                    | Err(DropletError::Duckdb(_))
+                    | Err(DropletError::BadHandle(_))
+            ),
+        "host dispatch from inside map() callbacks must complete or surface a contained error; got {r:?}"
+    );
+    if let Ok(MontyObject::List(items)) = &r {
+        assert_eq!(
+            items,
+            &vec![
+                MontyObject::Int(17),
+                MontyObject::Int(27),
+                MontyObject::Int(37)
+            ],
+            "map re-entry must produce correct results, proving suspend/resume + handle registry stayed coherent across 3 nested host calls; got {r:?}"
+        );
+    }
 }
 
 /// `HOLDS` — Lists use index-based iteration with no mutation guard, so the backing Vec reallocates underneath the iterator — pins that index revalidation (not a cached raw pointer into the old allocation) prevents a UAF on growth. Distinct from the dict/set guard tests which RAISE.
@@ -75,7 +150,16 @@ fn reentrant_host_dispatch_from_map_callback() {
 fn list_self_append_during_iteration_index_growth() {
     let code = "L = [0]\nn = 0\nfor x in L:\n    n += 1\n    if n < 5000:\n        L.append(x)\n    if n >= 5000:\n        break\n(n, len(L))";
     let r = Session::new("ms-iter-append").unwrap().run_code(code);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "appending to a list while iterating it (index-based iterator) must walk the live length safely — no UAF on the backing buffer as it reallocates; got {r:?}"); if let Ok(MontyObject::Tuple(t)) = &r { assert!(matches!(t.first(), Some(MontyObject::Int(n)) if *n == 5000), "iteration count must reach the self-imposed bound, proving index revalidation not a cached pointer; got {r:?}"); }
+    assert!(
+        r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+        "appending to a list while iterating it (index-based iterator) must walk the live length safely — no UAF on the backing buffer as it reallocates; got {r:?}"
+    );
+    if let Ok(MontyObject::Tuple(t)) = &r {
+        assert!(
+            matches!(t.first(), Some(MontyObject::Int(n)) if *n == 5000),
+            "iteration count must reach the self-imposed bound, proving index revalidation not a cached pointer; got {r:?}"
+        );
+    }
 }
 
 /// `HOLDS` — Exercises the dict iterator's expected_len mutation check — a distinct invalidation gadget from the list (lists have no such check; sets use a different table). Confirms the hash-table iterator detects realloc rather than reading freed buckets.
@@ -84,7 +168,11 @@ fn list_self_append_during_iteration_index_growth() {
 fn dict_mutate_during_iteration_runtime_error() {
     let code = "d = {1: 1, 2: 2, 3: 3}\ntry:\n    for key in d:\n        d[key + 100] = 0\n    out = 'no_error'\nexcept RuntimeError:\n    out = 'runtime_error'\nexcept Exception:\n    out = 'other'\nout";
     let r = Session::new("ms-dict-iter").unwrap().run_code(code);
-    assert!(matches!(&r, Ok(MontyObject::String(s)) if s == "runtime_error" || s == "other") || matches!(&r, Err(DropletError::Monty(_))), "growing a dict during iteration must be detected (RuntimeError 'changed size during iteration') and surface as an in-sandbox value or a contained Monty error — never a panic or a read of a freed/rehashed bucket; got {r:?}");
+    assert!(
+        matches!(&r, Ok(MontyObject::String(s)) if s == "runtime_error" || s == "other")
+            || matches!(&r, Err(DropletError::Monty(_))),
+        "growing a dict during iteration must be detected (RuntimeError 'changed size during iteration') and surface as an in-sandbox value or a contained Monty error — never a panic or a read of a freed/rehashed bucket; got {r:?}"
+    );
 }
 
 /// `HOLDS` — Set's open-addressing rehash on growth is a different backing table than dict's; add() forces a resize mid-walk — a distinct iterator-invalidation seam from the dict test.
@@ -93,7 +181,11 @@ fn dict_mutate_during_iteration_runtime_error() {
 fn set_mutate_during_iteration_runtime_error() {
     let code = "s = {1, 2, 3, 4}\ntry:\n    for v in s:\n        s.add(v + 1000)\n    out = 'no_error'\nexcept RuntimeError:\n    out = 'runtime_error'\nexcept Exception:\n    out = 'other'\nout";
     let r = Session::new("ms-set-iter").unwrap().run_code(code);
-    assert!(matches!(&r, Ok(MontyObject::String(s)) if s == "runtime_error" || s == "other") || matches!(&r, Err(DropletError::Monty(_))), "adding to a set during iteration must be detected and surface as an in-sandbox value or contained Monty error, never read a freed/rehashed bucket or panic; got {r:?}");
+    assert!(
+        matches!(&r, Ok(MontyObject::String(s)) if s == "runtime_error" || s == "other")
+            || matches!(&r, Err(DropletError::Monty(_))),
+        "adding to a set during iteration must be detected and surface as an in-sandbox value or contained Monty error, never read a freed/rehashed bucket or panic; got {r:?}"
+    );
 }
 
 /// `HOLDS` — Stresses non-bytecode recursion: the structure is built iteratively so the 1000-frame call cap does NOT apply, but dropping/GC-traversing it must not recurse unboundedly on the Rust stack. Distinct from the materialize-as-return test which crosses the value out.
@@ -103,7 +195,10 @@ fn deeply_nested_list_built_and_dropped_drop_recursion() {
     super::run_big_stack(move || {
         let code = "x = []\nfor i in range(5000):\n    x = [x]\nn = 0\ncur = x\nwhile isinstance(cur, list) and len(cur) == 1:\n    cur = cur[0]\n    n += 1\n    if n > 6000:\n        break\nn";
         let r = Session::new("ms-deep-nest").unwrap().run_code(code);
-        assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "building and traversing a 5000-deep nested structure, then dropping it, must not overflow the Rust stack during recursive drop/GC traversal — expected an int depth or contained Monty error, never a segfault/abort; got {r:?}");
+        assert!(
+            r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+            "building and traversing a 5000-deep nested structure, then dropping it, must not overflow the Rust stack during recursive drop/GC traversal — expected an int depth or contained Monty error, never a segfault/abort; got {r:?}"
+        );
     });
 }
 
@@ -114,7 +209,28 @@ fn deep_nesting_materialized_as_run_code_return_value() {
     super::run_big_stack(move || {
         let code = "x = 0\nfor i in range(3000):\n    x = [x]\nx";
         let r = Session::new("ms-deep-return").unwrap().run_code(code);
-        assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "returning a 3000-deep nested list as the run_code value must not blow the stack inside Monty's value materialization; got {r:?}"); if let Ok(v) = &r { let mut cur = v; let mut levels = 0; while let MontyObject::List(items) = cur { if items.len() != 1 { break; } cur = &items[0]; levels += 1; if levels > 10 { break; } } assert!(levels >= 5, "expected a genuinely nested list result, not a truncated/forged value; got {r:?}"); }
+        assert!(
+            r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+            "returning a 3000-deep nested list as the run_code value must not blow the stack inside Monty's value materialization; got {r:?}"
+        );
+        if let Ok(v) = &r {
+            let mut cur = v;
+            let mut levels = 0;
+            while let MontyObject::List(items) = cur {
+                if items.len() != 1 {
+                    break;
+                }
+                cur = &items[0];
+                levels += 1;
+                if levels > 10 {
+                    break;
+                }
+            }
+            assert!(
+                levels >= 5,
+                "expected a genuinely nested list result, not a truncated/forged value; got {r:?}"
+            );
+        }
     });
 }
 
@@ -124,7 +240,16 @@ fn deep_nesting_materialized_as_run_code_return_value() {
 fn self_referential_repr_is_cycle_guarded() {
     let code = "a = []\na.append(a)\ns = str(a)\nlen(s)";
     let r = Session::new("ms-self-repr").unwrap().run_code(code);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "str() of a self-referential list must terminate via the repr cycle guard ('[...]'), never infinitely recurse/overflow; got {r:?}"); if let Ok(MontyObject::Int(n)) = &r { assert!(*n > 0 && *n < 1000, "repr of a 1-cycle must be short (e.g. '[[...]]'), proving the guard fired; got len {n}"); }
+    assert!(
+        r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+        "str() of a self-referential list must terminate via the repr cycle guard ('[...]'), never infinitely recurse/overflow; got {r:?}"
+    );
+    if let Ok(MontyObject::Int(n)) = &r {
+        assert!(
+            *n > 0 && *n < 1000,
+            "repr of a 1-cycle must be short (e.g. '[[...]]'), proving the guard fired; got len {n}"
+        );
+    }
 }
 
 /// `HOLDS` — The blog's 'exception stored-in-container then GC'd then re-raised' shape: an Exception held only via a list ref, after dropping the list but keeping a name, must retain a valid message buffer when re-raised. A refcount/lifetime probe specific to Exception objects — distinct from list/dict/set value lifetimes.
@@ -133,7 +258,11 @@ fn self_referential_repr_is_cycle_guarded() {
 fn exception_stored_in_container_then_reraised() {
     let code = "box = []\ntry:\n    raise ValueError('payload-XYZ')\nexcept ValueError as e:\n    box.append(e)\nsaved = box[0]\nbox = None\ntry:\n    raise saved\nexcept ValueError as e2:\n    out = str(e2)\nout";
     let r = Session::new("ms-exc-resurrect").unwrap().run_code(code);
-    assert!(matches!(&r, Ok(MontyObject::String(s)) if s.contains("payload-XYZ")) || matches!(&r, Err(DropletError::Monty(_))), "an exception stored in a container, surviving the container's drop, then re-raised must carry its original payload (no UAF on the exception's message buffer); got {r:?}");
+    assert!(
+        matches!(&r, Ok(MontyObject::String(s)) if s.contains("payload-XYZ"))
+            || matches!(&r, Err(DropletError::Monty(_))),
+        "an exception stored in a container, surviving the container's drop, then re-raised must carry its original payload (no UAF on the exception's message buffer); got {r:?}"
+    );
 }
 
 /// `CANARY` — Pins that `2**200000` returns Ok under the session's LimitedTracker (max_memory 256 MiB). Bounded to 2**200000 so the test runs in reasonable time; the magnitude is the canary marker. Distinct allocator path from container repeat.
@@ -143,7 +272,10 @@ fn exception_stored_in_container_then_reraised() {
 fn huge_int_pow_preallocation_under_session_memory_budget() {
     let code = "x = 2 ** 200000\nx % 7";
     let r = Session::new("ms-hugeint").unwrap().run_code(code);
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))), "CANARY: 2**200000 allocates the BigInt because its estimated peak fits under the 256 MiB LimitedTracker budget; at this bounded magnitude it must complete or surface a contained error (documenting the absent absolute pow-bit ceiling). got {r:?}");
+    assert!(
+        r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+        "CANARY: 2**200000 allocates the BigInt because its estimated peak fits under the 256 MiB LimitedTracker budget; at this bounded magnitude it must complete or surface a contained error (documenting the absent absolute pow-bit ceiling). got {r:?}"
+    );
 }
 
 /// `CANARY` — Pins that `2**10_000_000` returns Ok under the session's LimitedTracker (max_memory 256 MiB, in place since Task 2).
@@ -158,13 +290,17 @@ fn huge_int_pow_must_be_bounded_under_limited_tracker() {
     // CANARY: 2**10_000_000 is Ok(BigInt(...)) because its ~10 MB estimated peak fits under the
     // 256 MiB LimitedTracker budget. Catching this would need a lower budget or an absolute
     // pow-bit ceiling. Session must survive either way.
-    assert!(r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
+    assert!(
+        r.is_ok() || matches!(r, Err(DropletError::Monty(_))),
         "CANARY: 2**10_000_000 resolves to a value because its estimated peak (~10 MB) fits under \
         the 256 MiB LimitedTracker budget; or a contained MemoryError if budget is later tightened; \
-        never panic/UAF; got {r:?}");
+        never panic/UAF; got {r:?}"
+    );
     let survive = s.run_code("1 + 1");
-    assert!(matches!(survive, Ok(MontyObject::Int(2))),
-        "the session REPL must survive; got {survive:?}");
+    assert!(
+        matches!(survive, Ok(MontyObject::Int(2))),
+        "the session REPL must survive; got {survive:?}"
+    );
 }
 
 /// `CANARY` — Different allocator path than int pow (sequence repeat via check_repeat_size, building a 500k-element heap Vec) — pins that the same budget-fit behavior applies to container pre-allocation, not just bignums.
@@ -174,7 +310,11 @@ fn huge_int_pow_must_be_bounded_under_limited_tracker() {
 fn list_repeat_huge_count_preallocation() {
     let code = "L = [0] * 500000\nlen(L)";
     let r = Session::new("ms-listrepeat").unwrap().run_code(code);
-    assert!(matches!(&r, Ok(MontyObject::Int(n)) if *n == 500000) || matches!(&r, Err(DropletError::Monty(_))), "CANARY: [0]*500000 allocates the 500k-element list because its estimated size fits under the 256 MiB LimitedTracker budget; check_repeat_size runs and correctly passes; at this bounded count it must complete (len==500000) or surface a contained error; got {r:?}");
+    assert!(
+        matches!(&r, Ok(MontyObject::Int(n)) if *n == 500000)
+            || matches!(&r, Err(DropletError::Monty(_))),
+        "CANARY: [0]*500000 allocates the 500k-element list because its estimated size fits under the 256 MiB LimitedTracker budget; check_repeat_size runs and correctly passes; at this bounded count it must complete (len==500000) or surface a contained error; got {r:?}"
+    );
 }
 
 /// `HOLDS` — The one Hack-Monty multi-hop gadget entirely absent from the suite: finalizer resurrection (object re-inserts itself during collection, defeating the refcount==0 free assumption). Even if Monty has no user __del__ support, the contract is a clean contained error, never a crash. Distinct from every cycle/UAF/iterator angle. If Monty lacks __del__ it folds to a contained Monty error and HOLDS trivially; if it supports finalizers it stresses the resurrection path. Either way no crash is the contract.
@@ -182,6 +322,19 @@ fn list_repeat_huge_count_preallocation() {
 #[test]
 fn finalizer_resurrection_during_collection_is_contained() {
     let code = "survivor = []\nclass R:\n    def __del__(self):\n        survivor.append(self)\ntry:\n    for _ in range(500):\n        r = R()\n        r = None\n    out = ('ok', len(survivor))\nexcept Exception:\n    out = ('exc', len(survivor))\nout";
-    let r = crate::session::Session::new("ms-finalizer-resurrect").unwrap().run_code(code);
-    assert!(r.is_ok() || matches!(r, Err(crate::DropletError::Monty(_))), "a __del__ finalizer that resurrects the object into a live container during drop/collection must not corrupt the heap root-set or panic/UAF; expected a value or a contained Monty error (incl. a clean 'no __del__ support' AttributeError/TypeError), got {r:?}"); assert_eq!(crate::session::Session::new("ms-finalizer-resurrect2").unwrap().run_code("1+1").unwrap(), monty::MontyObject::Int(2), "a fresh session is unaffected");
+    let r = crate::session::Session::new("ms-finalizer-resurrect")
+        .unwrap()
+        .run_code(code);
+    assert!(
+        r.is_ok() || matches!(r, Err(crate::DropletError::Monty(_))),
+        "a __del__ finalizer that resurrects the object into a live container during drop/collection must not corrupt the heap root-set or panic/UAF; expected a value or a contained Monty error (incl. a clean 'no __del__ support' AttributeError/TypeError), got {r:?}"
+    );
+    assert_eq!(
+        crate::session::Session::new("ms-finalizer-resurrect2")
+            .unwrap()
+            .run_code("1+1")
+            .unwrap(),
+        monty::MontyObject::Int(2),
+        "a fresh session is unaffected"
+    );
 }

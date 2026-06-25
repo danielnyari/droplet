@@ -1,13 +1,13 @@
 // crates/droplet-core/src/security/isolation.rs
 //! Session / work_dir isolation + run_id path traversal — adversarial angles. seam: `session.rs` Session::new/Drop, the `temp_dir().join(format!("droplet-{run_id}"))` path build.
 #![allow(unused_imports)]
-use monty::MontyObject;
+use super::{catch_dispatch, dispatch, list_len, sales_parquet, tmp_dir, write_parquet};
 use crate::DropletError;
-use crate::session::Session;
-use crate::engine_duckdb::{DuckEngine, Dataset, DEFAULT_MAX_RESULT_ROWS};
+use crate::engine_duckdb::{DEFAULT_MAX_RESULT_ROWS, Dataset, DuckEngine};
 use crate::registry::Registry;
+use crate::session::Session;
 use crate::tool::{Tool, ToolCx};
-use super::{dispatch, catch_dispatch, tmp_dir, sales_parquet, write_parquet, list_len};
+use monty::MontyObject;
 
 #[cfg(test)]
 mod tests {
@@ -23,18 +23,28 @@ mod tests {
         let run_id = "../../../../../../tmp/droplet-evil-traversal-probe";
         let sess = Session::new(run_id);
         let made = sess.as_ref().ok().map(|s| s.work_dir().to_path_buf());
-        let canon_made = made.as_ref().map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
-        if let Some(c) = &canon_made { let _ = std::fs::remove_dir_all(c); }
+        let canon_made = made
+            .as_ref()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+        if let Some(c) = &canon_made {
+            let _ = std::fs::remove_dir_all(c);
+        }
         // belt-and-suspenders cleanup at both possible resolutions:
-        let _ = std::fs::remove_dir_all(std::path::Path::new("/private/var/tmp/droplet-evil-traversal-probe"));
-        let _ = std::fs::remove_dir_all(std::path::Path::new("/var/tmp/droplet-evil-traversal-probe"));
+        let _ = std::fs::remove_dir_all(std::path::Path::new(
+            "/private/var/tmp/droplet-evil-traversal-probe",
+        ));
+        let _ = std::fs::remove_dir_all(std::path::Path::new(
+            "/var/tmp/droplet-evil-traversal-probe",
+        ));
         // FINDING: CANARY pinning OBSERVED behavior — Session::new succeeds and work_dir escapes temp_dir.
         // If this test ever starts PASSING the original assert (i.e., work_dir stays inside temp_dir or Err),
         // the gap is fixed — delete this CANARY and re-enable the CONTRACT assert.
         match &canon_made {
             None => { /* Err would mean the gap is fixed — update this test */ }
-            Some(c) => assert!(!c.starts_with(&base),
-                "CANARY: Session::new now refuses the traversal (work_dir={c:?} is inside temp_dir) — the gap is FIXED, update this test"),
+            Some(c) => assert!(
+                !c.starts_with(&base),
+                "CANARY: Session::new now refuses the traversal (work_dir={c:?} is inside temp_dir) — the gap is FIXED, update this test"
+            ),
         }
     }
 
@@ -56,8 +66,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&victim); // cleanup
         // FINDING: CANARY pinning OBSERVED behavior — Session::new deletes the victim dir outside temp_dir.
         // still_there == false means the file was wiped: that is the OBSERVED gap.
-        assert!(!still_there,
-            "CANARY: keepme.txt survived — Session::new no longer wipes outside temp_dir (gap may be FIXED, update this test)");
+        assert!(
+            !still_there,
+            "CANARY: keepme.txt survived — Session::new no longer wipes outside temp_dir (gap may be FIXED, update this test)"
+        );
     }
 
     /// `HOLDS` — Embedded-NUL injection: distinct OS-level rejection path; confirms the error folds cleanly instead of panicking inside the constructor.
@@ -68,8 +80,10 @@ mod tests {
         // A NUL byte in the path must surface as a contained DropletError::Io, never panic/UB.
         let result = result.expect("Session::new must not panic on a NUL-byte run_id");
         let is_io_err = matches!(result, Err(DropletError::Io(_)));
-        assert!(is_io_err,
-            "NUL-byte run_id must fold into DropletError::Io (got a non-Io variant or Ok)");
+        assert!(
+            is_io_err,
+            "NUL-byte run_id must fold into DropletError::Io (got a non-Io variant or Ok)"
+        );
     }
 
     /// `HOLDS` — Negative control proving the boundary fails ONLY on real '/'+'..' — pins encoder behavior so a future 'decode run_id' change is caught.
@@ -77,12 +91,16 @@ mod tests {
     #[test]
     fn run_id_url_encoded_slash_does_not_traverse() {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let sess = Session::new("..%2f..%2f..%2fetc%2fevil").expect("a literal (non-separator) run_id should construct");
+        let sess = Session::new("..%2f..%2f..%2fetc%2fevil")
+            .expect("a literal (non-separator) run_id should construct");
         let canon = std::fs::canonicalize(sess.work_dir()).unwrap();
         let inside = canon.starts_with(&base);
         drop(sess);
         // %2f is a literal filename byte, not a separator, so this must stay safely inside temp_dir.
-        assert!(inside, "URL-encoded slashes must NOT traverse; work_dir {canon:?} escaped temp_dir {base:?}");
+        assert!(
+            inside,
+            "URL-encoded slashes must NOT traverse; work_dir {canon:?} escaped temp_dir {base:?}"
+        );
     }
 
     /// `CANARY` — Run_id collision: two concurrent sessions sharing a run_id silently corrupt each other's on-disk isolation — a lifecycle/isolation bug distinct from path traversal.
@@ -99,8 +117,10 @@ mod tests {
         let a_state_survived = marker.exists();
         drop(a);
         // FINDING: CANARY pinning OBSERVED behavior — B's constructor wipes A's marker (survived=false).
-        assert!(!a_state_survived,
-            "CANARY: A's marker survived — same-run_id collision no longer wipes the first session (gap may be FIXED, update this test)");
+        assert!(
+            !a_state_survived,
+            "CANARY: A's marker survived — same-run_id collision no longer wipes the first session (gap may be FIXED, update this test)"
+        );
     }
 
     /// `HOLDS` — Handle-namespace isolation: handles are per-session integers from 0; the same int in another session must not silently resolve to anything (no shared Registry).
@@ -109,9 +129,15 @@ mod tests {
     fn two_sessions_do_not_share_handle_registries() {
         let dir = std::env::temp_dir().join("droplet-iso-handles");
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("s.parquet"); let p = p.to_str().unwrap().to_string();
-        { let conn = duckdb::Connection::open_in_memory().unwrap();
-          conn.execute_batch(&format!("COPY (SELECT 'EU' AS region, CAST(1.0 AS DOUBLE) AS amt) TO '{p}' (FORMAT PARQUET)")).unwrap(); }
+        let p = dir.join("s.parquet");
+        let p = p.to_str().unwrap().to_string();
+        {
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT 'EU' AS region, CAST(1.0 AS DOUBLE) AS amt) TO '{p}' (FORMAT PARQUET)"
+            ))
+            .unwrap();
+        }
         let mut a = Session::new("iso-a").unwrap();
         let ha = a.run_code(&format!("register({p:?})")).unwrap(); // first handle in A == Int(0)
         let mut b = Session::new("iso-b").unwrap();
@@ -119,8 +145,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(ha, MontyObject::Int(0)), "first handle in A is 0");
         // Same integer handle value, but B's registry is independent: handle 0 is unknown in B.
-        assert!(b_resolve.is_err(),
-            "a handle registered only in session A must NOT resolve in session B (got {b_resolve:?})");
+        assert!(
+            b_resolve.is_err(),
+            "a handle registered only in session A must NOT resolve in session B (got {b_resolve:?})"
+        );
     }
 
     /// `HOLDS` — Teardown completeness: ensures Drop cleans residue regardless of live host-side state, closing the disk-residue window between runs. Extends existing drop_wipes_the_work_dir by holding live handles + a spilled file.
@@ -131,9 +159,15 @@ mod tests {
         // because Session::new("iso-drop") creates droplet-iso-drop and wipes it first.
         let fixture_dir = std::env::temp_dir().join("droplet-iso-drop-fixture");
         std::fs::create_dir_all(&fixture_dir).unwrap();
-        let p = fixture_dir.join("s.parquet"); let p = p.to_str().unwrap().to_string();
-        { let conn = duckdb::Connection::open_in_memory().unwrap();
-          conn.execute_batch(&format!("COPY (SELECT 'EU' AS region, CAST(1.0 AS DOUBLE) AS amt) TO '{p}' (FORMAT PARQUET)")).unwrap(); }
+        let p = fixture_dir.join("s.parquet");
+        let p = p.to_str().unwrap().to_string();
+        {
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT 'EU' AS region, CAST(1.0 AS DOUBLE) AS amt) TO '{p}' (FORMAT PARQUET)"
+            ))
+            .unwrap();
+        }
         let work_path = {
             let mut s = Session::new("iso-drop").unwrap();
             s.run_code(&format!("register({p:?})")).unwrap();
@@ -141,8 +175,10 @@ mod tests {
             s.work_dir().to_path_buf()
         }; // <- Drop runs here
         let _ = std::fs::remove_dir_all(&fixture_dir);
-        assert!(!work_path.exists(),
-            "Drop must wipe the session work_dir (and its residue) even when handles/datasets were live; {work_path:?} still exists");
+        assert!(
+            !work_path.exists(),
+            "Drop must wipe the session work_dir (and its residue) even when handles/datasets were live; {work_path:?} still exists"
+        );
     }
 
     /// `HOLDS` — Lifecycle double-teardown: close() + Drop both remove the same dir; asserts no panic from the second best-effort wipe (idempotent teardown).
@@ -154,7 +190,10 @@ mod tests {
         let close_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.close()));
         // close() consumes self (remove_dir_all) then Drop runs on the moved-out value — must not panic or error spuriously.
         let close_res = close_res.expect("Session::close must not panic");
-        assert!(close_res.is_ok(), "close() on a fresh session should succeed: {close_res:?}");
+        assert!(
+            close_res.is_ok(),
+            "close() on a fresh session should succeed: {close_res:?}"
+        );
         assert!(!work_path.exists(), "close() must wipe the work_dir");
     }
 
@@ -175,10 +214,15 @@ mod tests {
         let leftover = first_seg.exists();
         let _ = std::fs::remove_dir_all(&first_seg);
         // The work_dir stays inside temp_dir (good — no escape).
-        assert!(work_canon.starts_with(&base), "nested run_id must stay under temp_dir, got {work_canon:?}");
+        assert!(
+            work_canon.starts_with(&base),
+            "nested run_id must stay under temp_dir, got {work_canon:?}"
+        );
         // FINDING: CANARY pinning OBSERVED behavior — parent dirs are NOT removed by Drop (leftover==true).
-        assert!(leftover,
-            "CANARY: no leftover parent dirs found — Drop now fully cleans the nested tree (gap may be FIXED, update this test)");
+        assert!(
+            leftover,
+            "CANARY: no leftover parent dirs found — Drop now fully cleans the nested tree (gap may be FIXED, update this test)"
+        );
     }
 
     /// `HOLDS` — Length/DoS edge: a 5000-char single component exceeds NAME_MAX; tests the constructor degrades to a clean Err (or contained dir) rather than panicking.
@@ -192,9 +236,14 @@ mod tests {
         match res {
             Err(DropletError::Io(_)) => { /* acceptable: name-too-long rejected cleanly */ }
             Err(other) => panic!("long run_id should fail (if at all) as Io, got {other:?}"),
-            Ok(s) => { let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-                       let c = std::fs::canonicalize(s.work_dir()).unwrap();
-                       assert!(c.starts_with(&base), "long run_id work_dir escaped temp_dir: {c:?}"); }
+            Ok(s) => {
+                let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+                let c = std::fs::canonicalize(s.work_dir()).unwrap();
+                assert!(
+                    c.starts_with(&base),
+                    "long run_id work_dir escaped temp_dir: {c:?}"
+                );
+            }
         }
     }
 
@@ -213,8 +262,17 @@ mod tests {
         let _ = std::fs::remove_file(&sentinel);
         // Empty run_id must resolve to a NON-ROOT child (temp_dir/droplet-), never temp_dir itself,
         // so neither create nor the Drop wipe can touch temp_dir root or its other contents.
-        assert_ne!(work_canon, base, "empty run_id must not make work_dir == temp_dir root");
-        assert!(work_canon.starts_with(&base) && work_canon != base, "work_dir {work_canon:?} must be a strict child of temp_dir");
-        assert!(sentinel_survived, "empty run_id teardown must not wipe temp_dir contents (sentinel deleted!)");
+        assert_ne!(
+            work_canon, base,
+            "empty run_id must not make work_dir == temp_dir root"
+        );
+        assert!(
+            work_canon.starts_with(&base) && work_canon != base,
+            "work_dir {work_canon:?} must be a strict child of temp_dir"
+        );
+        assert!(
+            sentinel_survived,
+            "empty run_id teardown must not wipe temp_dir contents (sentinel deleted!)"
+        );
     }
 }

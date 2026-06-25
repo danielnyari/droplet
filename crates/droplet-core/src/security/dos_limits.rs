@@ -4,11 +4,11 @@
 //! from ABOVE (real bombs must trip it and the session must survive); the `#[ignore]`d watchdog
 //! CANARYs pin the residual pure-CPU spin gap (needs a future `max_duration`).
 #![allow(unused_imports)]
-use monty::MontyObject;
+use super::{list_len, sales_parquet, tmp_dir, write_parquet};
 use crate::DropletError;
-use crate::session::Session;
 use crate::engine_duckdb::DEFAULT_MAX_RESULT_ROWS;
-use super::{tmp_dir, sales_parquet, write_parquet, list_len};
+use crate::session::Session;
+use monty::MontyObject;
 
 /// `HOLDS` — Pins the exact field-type/constructor edit and proves a generous budget does not break trivial legit execution. Distinct from every bomb: it asserts the limiter is wired AND harmless to legit work.
 /// seam: session.rs Session.repl field type + Session::new constructor (NoLimitTracker -> LimitedTracker swap; field becomes Option<MontyRepl<LimitedTracker>>, settle() retyped)
@@ -33,7 +33,15 @@ fn nested_list_object_fanout_bomb_is_bounded() {
     let bomb = "x = [[0] * 1000 for _ in range(10 ** 7)]";
     let err = s.run_code(bomb);
     let after = s.run_code("len([1,2,3])");
-    assert!(err.is_err(), "object-fanout explosion must trip the allocation-count cap"); assert!(matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)), "breach must surface as the resource/Monty error path, got {err:?}"); assert!(after.is_ok(), "session REPL must survive a bounded breach");
+    assert!(
+        err.is_err(),
+        "object-fanout explosion must trip the allocation-count cap"
+    );
+    assert!(
+        matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)),
+        "breach must surface as the resource/Monty error path, got {err:?}"
+    );
+    assert!(after.is_ok(), "session REPL must survive a bounded breach");
 }
 
 /// `LIMIT` — Single-object MEMORY growth (Vec backing-store realloc via on_grow), distinct from object-count fan-out. Proves the limiter's memory leg, not its count leg.
@@ -50,7 +58,19 @@ fn memory_growth_append_loop_is_bounded() {
     let bomb = "x = []\nwhile True:\n    x.append(0)";
     let err = s.run_code(bomb);
     let after = s.run_code("7 * 6");
-    assert!(err.is_err(), "unbounded list growth must be bounded by max_memory, not run forever"); assert!(matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)), "breach must surface as the resource/Monty error path, got {err:?}"); assert_eq!(after.unwrap(), MontyObject::Int(42), "session REPL must survive a bounded breach");
+    assert!(
+        err.is_err(),
+        "unbounded list growth must be bounded by max_memory, not run forever"
+    );
+    assert!(
+        matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)),
+        "breach must surface as the resource/Monty error path, got {err:?}"
+    );
+    assert_eq!(
+        after.unwrap(),
+        MontyObject::Int(42),
+        "session REPL must survive a bounded breach"
+    );
 }
 
 /// `HOLDS` — Stack-depth/control-flow DoS distinct from every heap angle; verifies the LimitedTracker swap preserves the 1000 recursion cap (ResourceLimits::new() keeps Some(1000)).
@@ -66,7 +86,15 @@ fn deep_recursion_already_bounded_at_1000_holds() {
         let bomb = "def f(n):\n    return f(n + 1)\nf(0)";
         let err = s.run_code(bomb);
         let after = s.run_code("1 + 1");
-        assert!(err.is_err(), "unbounded recursion must hit the 1000 cap, not overflow the host stack"); assert!(matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)), "recursion breach is the Monty error path, got {err:?}"); assert!(after.is_ok(), "session survives a recursion breach");
+        assert!(
+            err.is_err(),
+            "unbounded recursion must hit the 1000 cap, not overflow the host stack"
+        );
+        assert!(
+            matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)),
+            "recursion breach is the Monty error path, got {err:?}"
+        );
+        assert!(after.is_ok(), "session survives a recursion breach");
     });
 }
 
@@ -80,7 +108,12 @@ fn mutual_recursion_bounded_holds() {
         let bomb = "def a(n):\n    return b(n + 1)\ndef b(n):\n    return a(n + 1)\na(0)";
         let err = s.run_code(bomb);
         let after = s.run_code("9");
-        assert!(err.is_err(), "mutual recursion must hit the depth cap"); assert!(matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)), "got {err:?}"); assert!(after.is_ok(), "session survives");
+        assert!(err.is_err(), "mutual recursion must hit the depth cap");
+        assert!(
+            matches!(err.as_ref().unwrap_err(), crate::DropletError::Monty(_)),
+            "got {err:?}"
+        );
+        assert!(after.is_ok(), "session survives");
     });
 }
 
@@ -97,27 +130,44 @@ fn alloc_breach_does_not_consume_repl_then_legit_analyze_runs() {
     // Then run a REAL multi-statement program in the SAME session: namespace intact, budget
     // still allows normal work (recoverable breach, repl restored by settle from ReplStartError).
     let v = s.run_code("a = 10\nb = 20\na + b");
-    assert_eq!(v.unwrap(), MontyObject::Int(30), "after a bounded DoS breach the session REPL must survive and keep running legit code");
+    assert_eq!(
+        v.unwrap(),
+        MontyObject::Int(30),
+        "after a bounded DoS breach the session REPL must survive and keep running legit code"
+    );
 }
 
 /// `HOLDS` — Lower-bracket calibration guard: proves the budget (both N and M) is high enough for a legitimate maximal 1000-row read-out. A too-tight budget is itself a DoS-on-legit-users finding. Distinct from every bomb (asserts the limiter does NOT fire).
 /// seam: session.rs run_code building a 1000-row list[dict] result under the chosen budget (calibration: limiter must NOT fire on legal max results)
 #[test]
 fn legit_thousand_row_to_rows_under_budget_holds() {
-    use crate::session::Session;
     use crate::engine_duckdb::DEFAULT_MAX_RESULT_ROWS;
+    use crate::session::Session;
     // Fixture dir must NOT match Session work_dir pattern (temp/droplet-{run_id}).
     // Use a "fixture-" prefix so Session::new() never wipes the parquet before the query runs.
     let dir = std::env::temp_dir().join("fixture-dos-legit-rows");
     std::fs::create_dir_all(&dir).unwrap();
     let big = dir.join("big.parquet").to_str().unwrap().to_string();
     let conn = duckdb::Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!("COPY (SELECT * FROM range(2500)) TO '{big}' (FORMAT PARQUET)")).unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM range(2500)) TO '{big}' (FORMAT PARQUET)"
+    ))
+    .unwrap();
     let mut s = Session::new("dos-legit-rows").unwrap();
     let out = s.run_code(&format!("query({big:?}, 'SELECT * FROM data')"));
-    let n = match &out { Ok(monty::MontyObject::List(v)) => v.len(), _ => 0 };
+    let n = match &out {
+        Ok(monty::MontyObject::List(v)) => v.len(),
+        _ => 0,
+    };
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(out.is_ok(), "a legit capped 1000-row read-out must NOT trip the budget: {out:?}"); assert_eq!(n, DEFAULT_MAX_RESULT_ROWS, "the full capped result still crosses");
+    assert!(
+        out.is_ok(),
+        "a legit capped 1000-row read-out must NOT trip the budget: {out:?}"
+    );
+    assert_eq!(
+        n, DEFAULT_MAX_RESULT_ROWS,
+        "the full capped result still crosses"
+    );
 }
 
 /// `HOLDS` — Second calibration guard using the realistic V1b analyze workload (tool round-trips + python control flow + lambda sort) — ensures host-dispatch resume cycles don't accumulate enough allocations to trip a too-tight budget. Distinct from the flat row-dump guard.
@@ -135,20 +185,29 @@ fn legit_multistep_handle_analyze_under_budget_holds() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!("COPY (SELECT region, amt::DOUBLE AS amt FROM (VALUES ('EU',100.0),('EU',50.0),('US',200.0),('APAC',300.0),('APAC',0.0)) AS t(region,amt)) TO '{p}' (FORMAT PARQUET)")).unwrap();
     let code = [
-      format!("ds = register({p:?})"),
-      "agg = group_agg(ds, ['region'], [('total','SUM(amt)'), ('n','CAST(COUNT(*) AS BIGINT)')])".to_string(),
-      "ranked = []".to_string(),
-      "for r in to_rows(agg):".to_string(),
-      "    avg = r['total'] / r['n']".to_string(),
-      "    if avg >= 100:".to_string(),
-      "        ranked.append({'region': r['region'], 'avg': avg})".to_string(),
-      "ranked.sort(key=lambda x: -x['avg'])".to_string(),
-      "ranked".to_string(),
-    ].join("\n");
+        format!("ds = register({p:?})"),
+        "agg = group_agg(ds, ['region'], [('total','SUM(amt)'), ('n','CAST(COUNT(*) AS BIGINT)')])"
+            .to_string(),
+        "ranked = []".to_string(),
+        "for r in to_rows(agg):".to_string(),
+        "    avg = r['total'] / r['n']".to_string(),
+        "    if avg >= 100:".to_string(),
+        "        ranked.append({'region': r['region'], 'avg': avg})".to_string(),
+        "ranked.sort(key=lambda x: -x['avg'])".to_string(),
+        "ranked".to_string(),
+    ]
+    .join("\n");
     let mut s = Session::new("dos-legit-multistep").unwrap();
     let out = s.run_code(&code);
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(out.is_ok(), "the legit multi-step analyze demo must run under the budget: {out:?}"); match out.unwrap() { monty::MontyObject::List(v) => assert_eq!(v.len(), 2, "US and APAC survive the threshold"), other => panic!("expected ranked list, got {other:?}") };
+    assert!(
+        out.is_ok(),
+        "the legit multi-step analyze demo must run under the budget: {out:?}"
+    );
+    match out.unwrap() {
+        monty::MontyObject::List(v) => assert_eq!(v.len(), 2, "US and APAC survive the threshold"),
+        other => panic!("expected ranked list, got {other:?}"),
+    };
 }
 
 /// `CANARY` — CPU-time exhaustion with ZERO allocation — the gap the allocation/memory caps structurally cannot close. Distinct from every heap/recursion angle; pins the missing wall-clock limit.
@@ -157,9 +216,9 @@ fn legit_multistep_handle_analyze_under_budget_holds() {
 #[test]
 fn watchdog_pure_cpu_spin_is_unbounded_canary() {
     // #[ignore] — run explicitly: cargo test watchdog_pure_cpu_spin -- --ignored
+    use crate::session::Session;
     use std::sync::mpsc;
     use std::time::Duration;
-    use crate::session::Session;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut s = Session::new("cpu-spin").unwrap();
@@ -167,7 +226,10 @@ fn watchdog_pure_cpu_spin_is_unbounded_canary() {
         let _ = tx.send(r.is_err());
     });
     let outcome = rx.recv_timeout(Duration::from_secs(3));
-    assert!(outcome.is_err(), "CANARY+FINDING: pure-CPU 'while True: pass' is NOT bounded by an alloc/memory-only limiter — it spun past the 3s watchdog. recv_timeout returning Err(RecvTimeoutError::Timeout) == still spinning. Flip to assert_eq!(outcome, Ok(true)) once ResourceLimits::max_duration is wired (LimitedTracker.check_time exists, resource.rs:576-593, but is dormant unless max_duration is Some).")
+    assert!(
+        outcome.is_err(),
+        "CANARY+FINDING: pure-CPU 'while True: pass' is NOT bounded by an alloc/memory-only limiter — it spun past the 3s watchdog. recv_timeout returning Err(RecvTimeoutError::Timeout) == still spinning. Flip to assert_eq!(outcome, Ok(true)) once ResourceLimits::max_duration is wired (LimitedTracker.check_time exists, resource.rs:576-593, but is dormant unless max_duration is Some)."
+    )
 }
 
 /// `CANARY` — Distinct CPU-DoS gadget from 'while True: pass': executes real arithmetic bytecode each iteration but with a value range (small int) that defeats BOTH allocation and memory tracking — proving the gap isn't just empty loops.
@@ -176,9 +238,9 @@ fn watchdog_pure_cpu_spin_is_unbounded_canary() {
 #[test]
 fn watchdog_non_allocating_arithmetic_spin_is_unbounded_canary() {
     // #[ignore] — companion CPU canary that does real bytecode work but allocates ~nothing.
+    use crate::session::Session;
     use std::sync::mpsc;
     use std::time::Duration;
-    use crate::session::Session;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut s = Session::new("arith-spin").unwrap();
@@ -186,7 +248,10 @@ fn watchdog_non_allocating_arithmetic_spin_is_unbounded_canary() {
         let _ = tx.send(r.is_err());
     });
     let outcome = rx.recv_timeout(Duration::from_secs(3));
-    assert!(outcome.is_err(), "CANARY+FINDING: a bounded-value arithmetic spin keeps i as an inline Value::Int(i64) (value.rs) so net heap growth is ~0 -> neither max_allocations nor max_memory can stop it; it ran past the 3s watchdog. A wall-clock max_duration is required. Flip once that lands.")
+    assert!(
+        outcome.is_err(),
+        "CANARY+FINDING: a bounded-value arithmetic spin keeps i as an inline Value::Int(i64) (value.rs) so net heap growth is ~0 -> neither max_allocations nor max_memory can stop it; it ran past the 3s watchdog. A wall-clock max_duration is required. Flip once that lands."
+    )
 }
 
 /// `LIMIT` — Bridges LIMIT and watchdog: verifies the allocation-count cap yields a TIMELY failure, not a multi-second grind — the real DoS-protection property. Distinct from the bare is_err() fan-out test.
@@ -196,9 +261,9 @@ fn watchdog_non_allocating_arithmetic_spin_is_unbounded_canary() {
 fn watchdog_proves_object_fanout_bomb_terminates_within_budget() {
     // Can run normally (it should terminate fast) or be #[ignore]d. Uses the watchdog to assert
     // the count-capped bomb returns QUICKLY — distinguishing 'bounded' from 'eventually bounded'.
+    use crate::session::Session;
     use std::sync::mpsc;
     use std::time::Duration;
-    use crate::session::Session;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut s = Session::new("bomb-prompt").unwrap();
@@ -207,5 +272,9 @@ fn watchdog_proves_object_fanout_bomb_terminates_within_budget() {
         let _ = tx.send(r.is_err());
     });
     let outcome = rx.recv_timeout(Duration::from_secs(10));
-    assert_eq!(outcome, Ok(true), "the object-fanout bomb must trip the count cap and return Err PROMPTLY (within 10s) — proving the budget bounds wall-clock for allocation-driven loops");
+    assert_eq!(
+        outcome,
+        Ok(true),
+        "the object-fanout bomb must trip the count cap and return Err PROMPTLY (within 10s) — proving the budget bounds wall-clock for allocation-driven loops"
+    );
 }

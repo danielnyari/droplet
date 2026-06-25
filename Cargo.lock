@@ -631,6 +631,7 @@ dependencies = [
  "duckdb",
  "inventory",
  "monty",
+ "num-bigint",
  "serde",
  "thiserror",
  "tokio",

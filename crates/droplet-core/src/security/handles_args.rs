@@ -3,13 +3,15 @@
 //! seam: `convert.rs` FromArg/IntoRet, `registry.rs` Registry, the `#[droplet_tool]` thunk's
 //! `args[i]` direct indexing (no bounds guard) in `macros/src/lib.rs`.
 #![allow(unused_imports)]
-use monty::MontyObject;
+use super::{
+    catch_dispatch, catch_dispatch_kw, dispatch, list_len, sales_parquet, tmp_dir, write_parquet,
+};
 use crate::DropletError;
-use crate::session::Session;
-use crate::engine_duckdb::{DuckEngine, Dataset, DEFAULT_MAX_RESULT_ROWS};
+use crate::engine_duckdb::{DEFAULT_MAX_RESULT_ROWS, Dataset, DuckEngine};
 use crate::registry::Registry;
+use crate::session::Session;
 use crate::tool::{Tool, ToolCx};
-use super::{dispatch, catch_dispatch, catch_dispatch_kw, tmp_dir, sales_parquet, write_parquet, list_len};
+use monty::MontyObject;
 
 #[cfg(test)]
 mod tests {
@@ -33,7 +35,10 @@ mod tests {
     #[test]
     fn to_rows_negative_handle_is_bad_arg_non_negative() {
         let err = dispatch("to_rows", &[MontyObject::Int(-1)]).unwrap_err();
-        assert!(matches!(err, DropletError::BadArg(ref m) if m.contains("non-negative")), "got {err:?}");
+        assert!(
+            matches!(err, DropletError::BadArg(ref m) if m.contains("non-negative")),
+            "got {err:?}"
+        );
     }
 
     /// `HOLDS` — BadArg/BadHandle boundary: 2**62 is a positive i64 so u64::try_from SUCCEEDS
@@ -43,7 +48,10 @@ mod tests {
     #[test]
     fn to_rows_huge_but_valid_i64_handle_is_bad_handle() {
         let err = dispatch("to_rows", &[MontyObject::Int(1i64 << 62)]).unwrap_err();
-        assert!(matches!(err, DropletError::BadHandle(h) if h == (1u64 << 62)), "got {err:?}");
+        assert!(
+            matches!(err, DropletError::BadHandle(h) if h == (1u64 << 62)),
+            "got {err:?}"
+        );
     }
 
     /// `HOLDS` — Type-confusion via integer overflow: 2**63 > i64::MAX so monty represents it as
@@ -54,7 +62,10 @@ mod tests {
     fn to_rows_2pow63_overflows_to_bigint_is_bad_arg() {
         let big = num_bigint::BigInt::from(1u128 << 63);
         let err = dispatch("to_rows", &[MontyObject::BigInt(big)]).unwrap_err();
-        assert!(matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")), "got {err:?}");
+        assert!(
+            matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")),
+            "got {err:?}"
+        );
     }
 
     /// `HOLDS` — Handle smuggled as text '0': must NOT be str->int coerced into a handle.
@@ -63,7 +74,10 @@ mod tests {
     #[test]
     fn to_rows_string_handle_is_bad_arg() {
         let err = dispatch("to_rows", &[MontyObject::String("0".into())]).unwrap_err();
-        assert!(matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")), "got {err:?}");
+        assert!(
+            matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")),
+            "got {err:?}"
+        );
     }
 
     /// `HOLDS` — Float 0.0 numerically equals handle 0 but is a different variant; proves no
@@ -72,7 +86,10 @@ mod tests {
     #[test]
     fn to_rows_float_handle_is_bad_arg() {
         let err = dispatch("to_rows", &[MontyObject::Float(0.0)]).unwrap_err();
-        assert!(matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")), "got {err:?}");
+        assert!(
+            matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")),
+            "got {err:?}"
+        );
     }
 
     /// `HOLDS` — A list wrapping a valid handle int must not be destructured into a handle. Attacks
@@ -81,7 +98,10 @@ mod tests {
     #[test]
     fn to_rows_list_handle_is_bad_arg() {
         let err = dispatch("to_rows", &[MontyObject::List(vec![MontyObject::Int(0)])]).unwrap_err();
-        assert!(matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")), "got {err:?}");
+        assert!(
+            matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")),
+            "got {err:?}"
+        );
     }
 
     /// `HOLDS` — Hack-Monty 'bytes object replacing a primitive': 8 zero bytes (LE u64 0) must NOT
@@ -89,8 +109,15 @@ mod tests {
     /// seam: convert.rs i64::from_monty catch-all (Bytes arm)
     #[test]
     fn to_rows_bytes_handle_is_bad_arg() {
-        let err = dispatch("to_rows", &[MontyObject::Bytes(vec![0u8, 0, 0, 0, 0, 0, 0, 0])]).unwrap_err();
-        assert!(matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")), "got {err:?}");
+        let err = dispatch(
+            "to_rows",
+            &[MontyObject::Bytes(vec![0u8, 0, 0, 0, 0, 0, 0, 0])],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")),
+            "got {err:?}"
+        );
     }
 
     /// `HOLDS` — Tuple is the OTHER as_seq-matchable variant. The scalar handle path must still
@@ -98,8 +125,12 @@ mod tests {
     /// seam: convert.rs i64::from_monty catch-all (Tuple arm)
     #[test]
     fn to_rows_tuple_handle_is_bad_arg() {
-        let err = dispatch("to_rows", &[MontyObject::Tuple(vec![MontyObject::Int(0)])]).unwrap_err();
-        assert!(matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")), "got {err:?}");
+        let err =
+            dispatch("to_rows", &[MontyObject::Tuple(vec![MontyObject::Int(0)])]).unwrap_err();
+        assert!(
+            matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")),
+            "got {err:?}"
+        );
     }
 
     // ── Registry isolation ─────────────────────────────────────────────────────────────────────────
@@ -142,13 +173,24 @@ mod tests {
         let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
         let mut engine = DuckEngine::new_in_memory().unwrap();
         let mut handles = Registry::new();
-        let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
-        let reg = inventory::iter::<Tool>().find(|t| t.name == "register").unwrap();
+        let mut cx = ToolCx {
+            engine: &mut engine,
+            handles: &mut handles,
+        };
+        let reg = inventory::iter::<Tool>()
+            .find(|t| t.name == "register")
+            .unwrap();
         let h = (reg.dispatch)(&mut cx, &[MontyObject::String(path)], &[]).unwrap();
-        let jn = inventory::iter::<Tool>().find(|t| t.name == "join").unwrap();
+        let jn = inventory::iter::<Tool>()
+            .find(|t| t.name == "join")
+            .unwrap();
         let err = (jn.dispatch)(
             &mut cx,
-            &[h, MontyObject::Int(999), MontyObject::String("l.id = r.id".into())],
+            &[
+                h,
+                MontyObject::Int(999),
+                MontyObject::String("l.id = r.id".into()),
+            ],
             &[],
         )
         .unwrap_err();
@@ -168,7 +210,8 @@ mod tests {
             MontyObject::String("usage".into()),
             MontyObject::Int(4242),
         ])]);
-        let err = dispatch("local_sql", &[MontyObject::String("SELECT 1".into()), arg]).unwrap_err();
+        let err =
+            dispatch("local_sql", &[MontyObject::String("SELECT 1".into()), arg]).unwrap_err();
         assert!(
             matches!(err, DropletError::BadHandle(4242)),
             "forged handle inside the dataset list must surface BadHandle, got {err:?}"
@@ -186,10 +229,17 @@ mod tests {
         let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
         let mut engine = DuckEngine::new_in_memory().unwrap();
         let mut handles = Registry::new();
-        let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
-        let reg = inventory::iter::<Tool>().find(|t| t.name == "register").unwrap();
+        let mut cx = ToolCx {
+            engine: &mut engine,
+            handles: &mut handles,
+        };
+        let reg = inventory::iter::<Tool>()
+            .find(|t| t.name == "register")
+            .unwrap();
         let h = (reg.dispatch)(&mut cx, &[MontyObject::String(path)], &[]).unwrap();
-        let ga = inventory::iter::<Tool>().find(|t| t.name == "group_agg").unwrap();
+        let ga = inventory::iter::<Tool>()
+            .find(|t| t.name == "group_agg")
+            .unwrap();
         let metrics = MontyObject::List(vec![MontyObject::Tuple(vec![
             MontyObject::String("t".into()),
             MontyObject::String("SUM(amount)".into()),
@@ -215,10 +265,17 @@ mod tests {
         let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
         let mut engine = DuckEngine::new_in_memory().unwrap();
         let mut handles = Registry::new();
-        let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
-        let reg = inventory::iter::<Tool>().find(|t| t.name == "register").unwrap();
+        let mut cx = ToolCx {
+            engine: &mut engine,
+            handles: &mut handles,
+        };
+        let reg = inventory::iter::<Tool>()
+            .find(|t| t.name == "register")
+            .unwrap();
         let h = (reg.dispatch)(&mut cx, &[MontyObject::String(path)], &[]).unwrap();
-        let ga = inventory::iter::<Tool>().find(|t| t.name == "group_agg").unwrap();
+        let ga = inventory::iter::<Tool>()
+            .find(|t| t.name == "group_agg")
+            .unwrap();
         let by = MontyObject::List(vec![MontyObject::Int(1), MontyObject::Int(2)]);
         let metrics = MontyObject::List(vec![MontyObject::Tuple(vec![
             MontyObject::String("t".into()),
@@ -240,10 +297,17 @@ mod tests {
         let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
         let mut engine = DuckEngine::new_in_memory().unwrap();
         let mut handles = Registry::new();
-        let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
-        let reg = inventory::iter::<Tool>().find(|t| t.name == "register").unwrap();
+        let mut cx = ToolCx {
+            engine: &mut engine,
+            handles: &mut handles,
+        };
+        let reg = inventory::iter::<Tool>()
+            .find(|t| t.name == "register")
+            .unwrap();
         let h = (reg.dispatch)(&mut cx, &[MontyObject::String(path)], &[]).unwrap();
-        let ga = inventory::iter::<Tool>().find(|t| t.name == "group_agg").unwrap();
+        let ga = inventory::iter::<Tool>()
+            .find(|t| t.name == "group_agg")
+            .unwrap();
         let by = MontyObject::List(vec![MontyObject::String("region".into())]);
         let metrics = MontyObject::List(vec![MontyObject::Tuple(vec![
             MontyObject::String("t".into()),
@@ -266,12 +330,21 @@ mod tests {
         let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
         let mut engine = DuckEngine::new_in_memory().unwrap();
         let mut handles = Registry::new();
-        let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
-        let reg = inventory::iter::<Tool>().find(|t| t.name == "register").unwrap();
+        let mut cx = ToolCx {
+            engine: &mut engine,
+            handles: &mut handles,
+        };
+        let reg = inventory::iter::<Tool>()
+            .find(|t| t.name == "register")
+            .unwrap();
         let h = (reg.dispatch)(&mut cx, &[MontyObject::String(path)], &[]).unwrap();
-        let ga = inventory::iter::<Tool>().find(|t| t.name == "group_agg").unwrap();
+        let ga = inventory::iter::<Tool>()
+            .find(|t| t.name == "group_agg")
+            .unwrap();
         let by = MontyObject::List(vec![MontyObject::String("region".into())]);
-        let metrics = MontyObject::List(vec![MontyObject::Tuple(vec![MontyObject::String("only".into())])]);
+        let metrics = MontyObject::List(vec![MontyObject::Tuple(vec![MontyObject::String(
+            "only".into(),
+        )])]);
         let err = (ga.dispatch)(&mut cx, &[h, by, metrics], &[]).unwrap_err();
         assert!(
             matches!(err, DropletError::BadArg(ref m) if m.contains("2-tuple")),
@@ -289,7 +362,8 @@ mod tests {
             MontyObject::String("usage".into()),
             MontyObject::String("not_a_handle".into()),
         ])]);
-        let err = dispatch("local_sql", &[MontyObject::String("SELECT 1".into()), arg]).unwrap_err();
+        let err =
+            dispatch("local_sql", &[MontyObject::String("SELECT 1".into()), arg]).unwrap_err();
         assert!(
             matches!(err, DropletError::BadArg(ref m) if m.contains("expected int")),
             "a str where a Dataset handle is required must be BadArg, got {err:?}"
@@ -303,7 +377,8 @@ mod tests {
     #[test]
     fn local_sql_dataset_list_inner_not_a_tuple_is_bad_arg() {
         let arg = MontyObject::List(vec![MontyObject::Int(0)]);
-        let err = dispatch("local_sql", &[MontyObject::String("SELECT 1".into()), arg]).unwrap_err();
+        let err =
+            dispatch("local_sql", &[MontyObject::String("SELECT 1".into()), arg]).unwrap_err();
         assert!(
             matches!(err, DropletError::BadArg(ref m) if m.contains("tuple[str, Dataset]")),
             "a non-tuple element in the dataset list must be BadArg, got {err:?}"
@@ -387,7 +462,10 @@ mod tests {
                 MontyObject::String("EXTRA".into()),
             ],
         );
-        assert!(res.is_ok(), "over-arity must not panic (thunk ignores the extra arg)");
+        assert!(
+            res.is_ok(),
+            "over-arity must not panic (thunk ignores the extra arg)"
+        );
         let inner = res.unwrap();
         assert!(
             inner.is_ok(),
@@ -410,7 +488,10 @@ mod tests {
     fn group_agg_missing_metrics_short_circuits_at_bad_handle() {
         let by = MontyObject::List(vec![MontyObject::String("region".into())]);
         let res = catch_dispatch("group_agg", &[MontyObject::Int(0), by]);
-        assert!(res.is_ok(), "must not panic — BadHandle(0) short-circuits before args[2] OOB");
+        assert!(
+            res.is_ok(),
+            "must not panic — BadHandle(0) short-circuits before args[2] OOB"
+        );
         let inner = res.unwrap();
         assert!(
             matches!(inner, Err(DropletError::BadHandle(0))),
@@ -458,7 +539,10 @@ mod tests {
     fn scalar_forged_handle_is_bad_handle_before_sql() {
         let err = dispatch(
             "scalar",
-            &[MontyObject::Int(31337), MontyObject::String("SUM(amount)".into())],
+            &[
+                MontyObject::Int(31337),
+                MontyObject::String("SUM(amount)".into()),
+            ],
         )
         .unwrap_err();
         assert!(

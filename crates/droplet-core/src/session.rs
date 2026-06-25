@@ -68,7 +68,10 @@ impl Session {
         // `?` folds duckdb::Error into DropletError (invariant #10).
         let duck = crate::engine_duckdb::DuckEngine::new_in_memory()?;
         // One persistent REPL per session, bounded by a session-lifetime resource budget.
-        let repl = Some(MontyRepl::new("session.py", LimitedTracker::new(session_limits())));
+        let repl = Some(MontyRepl::new(
+            "session.py",
+            LimitedTracker::new(session_limits()),
+        ));
         Ok(Self {
             run_id: run_id.to_string(),
             work_dir,
