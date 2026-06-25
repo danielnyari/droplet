@@ -16,6 +16,7 @@ use crate::session::Session;
 use crate::tool::{Tool, ToolCx};
 
 mod exfiltration;
+mod dos_limits;
 
 /// A unique temp dir per tag so fixtures never collide.
 pub(crate) fn tmp_dir(tag: &str) -> std::path::PathBuf {

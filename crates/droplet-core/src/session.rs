@@ -8,8 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use monty::{
-    ExtFunctionResult, MontyObject, MontyRepl, NameLookupResult, NoLimitTracker, PrintWriter,
-    ReplProgress, ReplStartError,
+    ExtFunctionResult, LimitedTracker, MontyObject, MontyRepl, NameLookupResult, PrintWriter,
+    ReplProgress, ReplStartError, ResourceLimits,
 };
 
 use crate::DropletError;
@@ -33,12 +33,25 @@ pub struct Session {
     // The session's persistent Monty REPL — agent code across run_code steps shares this namespace
     // (invariant #8: monty is fine in core; only pyo3 is barred). Held in an Option so run_code can
     // take it out for the duration of a step and put it back on Complete.
-    repl: Option<MontyRepl<NoLimitTracker>>,
+    // SWAPPED (Task 2): a session-lifetime resource budget bounds agent allocation/memory bombs.
+    repl: Option<MontyRepl<LimitedTracker>>,
     // Later milestones add (NOT in M0/M1):
     //   surreal: read-only Surreal<Mem>      // M9 — schema-derived field search (read-only)
     //   artifacts: Box<dyn ArtifactStore>    // M5 — content-addressed load cache
     //   coord:     Box<dyn CoordinationStore>// M7 — run registry / leases / cache index
     //   snapshots: Box<dyn SnapshotStore>    // M8 — REPL+manifest blobs
+}
+
+/// The per-session resource budget. BOTH limits are load-bearing: object fan-out is count-gated
+/// (`on_allocate` → `max_allocations`), list/dict growth is memory-gated (`on_grow` → `max_memory`).
+/// Recursion is already capped at 1000 by `ResourceLimits::new()`.
+/// ponytail: one tracker for the whole session lifetime (a per-`run_code` reset is the upgrade path
+/// if long-lived sessions exhaust the budget); a wall-clock `max_duration` is deferred (see the
+/// pure-CPU-spin watchdog canaries) until a host-interruptible time limit is needed.
+fn session_limits() -> ResourceLimits {
+    ResourceLimits::new()
+        .max_allocations(5_000_000)
+        .max_memory(256 * 1024 * 1024)
 }
 
 impl Session {
@@ -54,9 +67,8 @@ impl Session {
         // One ephemeral in-memory DuckDB per Session, built right after the work dir.
         // `?` folds duckdb::Error into DropletError (invariant #10).
         let duck = crate::engine_duckdb::DuckEngine::new_in_memory()?;
-        // One persistent REPL per session. NoLimitTracker for now; a real resource limiter is a
-        // later milestone (// SWAP: LimitedTracker for prod).
-        let repl = Some(MontyRepl::new("session.py", NoLimitTracker));
+        // One persistent REPL per session, bounded by a session-lifetime resource budget.
+        let repl = Some(MontyRepl::new("session.py", LimitedTracker::new(session_limits())));
         Ok(Self {
             run_id: run_id.to_string(),
             work_dir,
@@ -140,8 +152,8 @@ impl Session {
     /// (monty's `ReplStartError` carries it) so a raised exception doesn't poison the session.
     fn settle(
         &mut self,
-        r: Result<ReplProgress<NoLimitTracker>, Box<ReplStartError<NoLimitTracker>>>,
-    ) -> Result<ReplProgress<NoLimitTracker>, DropletError> {
+        r: Result<ReplProgress<LimitedTracker>, Box<ReplStartError<LimitedTracker>>>,
+    ) -> Result<ReplProgress<LimitedTracker>, DropletError> {
         r.map_err(|e| {
             let ReplStartError { repl, error } = *e;
             self.repl = Some(repl);
