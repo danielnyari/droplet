@@ -21,6 +21,7 @@ mod sandbox_escape;
 mod egress;
 mod writes_ddl;
 mod sql_injection;
+mod handles_args;
 
 /// A unique temp dir per tag so fixtures never collide.
 pub(crate) fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -70,6 +71,26 @@ pub(crate) fn catch_dispatch(
     args: &[MontyObject],
 ) -> std::thread::Result<Result<MontyObject, DropletError>> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(name, args)))
+}
+
+/// Like `dispatch` but passes explicit kwargs — exercises the `_kwargs` path (thunk ignores kwargs).
+/// Also wrapped in `catch_unwind` (same semantics as `catch_dispatch`).
+pub(crate) fn catch_dispatch_kw(
+    name: &str,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+) -> std::thread::Result<Result<MontyObject, DropletError>> {
+    let tool = inventory::iter::<Tool>()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("tool {name} must be registered"));
+    let kwargs_owned = kwargs.to_vec();
+    let args_owned = args.to_vec();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut engine = DuckEngine::new_in_memory().unwrap();
+        let mut handles = Registry::new();
+        let mut cx = ToolCx { engine: &mut engine, handles: &mut handles };
+        (tool.dispatch)(&mut cx, &args_owned, &kwargs_owned)
+    }))
 }
 
 /// Run a closure on a thread with a large (16 MiB) stack and propagate its panics, so a deep-recursion

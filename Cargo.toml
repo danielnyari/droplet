@@ -42,3 +42,5 @@ proc-macro2 = "1"
 inventory   = "0.3"
 # droplet-macros is a path member; referenced by droplet-core below.
 droplet-macros = { path = "crates/droplet-macros" }
+# num-bigint: direct dep for test-only BigInt construction (matches monty's transitive version).
+num-bigint  = "0.4"
