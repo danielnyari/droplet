@@ -27,3 +27,6 @@ __pycache__/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 /.feature-dev
+
+# subagent-driven-development scratch (progress ledger, briefs, review packages)
+.superpowers/
