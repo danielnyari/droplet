@@ -1,8 +1,9 @@
 # Adversarial security suite — findings ledger (2026-06-25 / 2026-06-26)
 
-Produced by executing `docs/superpowers/plans/2026-06-25-adversarial-test-suite.md`: **214 distinct-angle
-adversarial tests** (192 Rust in `crates/droplet-core/src/security/`, 22 Python in
-`crates/droplet-py/python/tests/test_security.py`) against the V1 code-mode agent surface. Every test
+Produced by executing `docs/superpowers/plans/2026-06-25-adversarial-test-suite.md`: **195 distinct-angle
+adversarial tests** (173 Rust `#[test]` fns across 11 class modules in `crates/droplet-core/src/security/`,
+22 Python in `crates/droplet-py/python/tests/test_security.py`) against the V1 code-mode agent surface —
+well past the plan's ≥100-Rust / ≥15-Python goal. Every test
 carries a contract label — **HOLDS** (a protection that works), **PROBE** (a contract we require;
 a failure is a finding), **CANARY** (pins an accepted/observed gap; flips when closed), **LIMIT**
 (bounded by the `LimitedTracker` budget). Each finding below was empirically reproduced (the highest-

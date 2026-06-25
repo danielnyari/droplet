@@ -7,7 +7,7 @@
 | **Affected** | The V1a walking skeleton — the `query(path, sql)` tool reached through `Session::run_code` (Rust) and `droplet.Session.run_code` (Python wheel) |
 | **Introduced** | V1a (`crates/droplet-core/src/tools.rs`, commit on branch `m0-skeleton`) |
 | **Fix lands** | **V3 — the governed load door** (see [§8 The fix](#8-the-fix-roadmap-v3)) |
-| **Canary test** | `crates/droplet-core/src/security_tests.rs::known_gap_local_file_read_is_currently_possible` |
+| **Canary test** | `crates/droplet-core/src/security/exfiltration.rs::known_gap_local_file_read_is_currently_possible` |
 
 ---
 
@@ -116,7 +116,7 @@ blocked. Blast radius: "read/write local, then return," not "read, then POST to 
 
 The gap is pinned by a **canary** rather than left implicit:
 
-`crates/droplet-core/src/security_tests.rs::known_gap_local_file_read_is_currently_possible` plants a
+`crates/droplet-core/src/security/exfiltration.rs::known_gap_local_file_read_is_currently_possible` plants a
 secret file outside the session dir, has the agent read it via `read_csv`, and asserts the contents
 leak. It **passes today** (documenting the vulnerable state) and will **fail the day the fix lands** —
 forcing whoever closes it to flip the assertion to "blocked." It is the executable tracking record.
@@ -183,8 +183,9 @@ Confirmed behavior with this applied: `read_parquet('<cache>/x.parquet')` (insid
 ## 9. References
 
 - Code: `crates/droplet-core/src/tools.rs` (`query`), `crates/droplet-core/src/engine_duckdb.rs`
-  (`new_in_memory` — the deliberate local-read decision), `crates/droplet-core/src/security_tests.rs`
-  (the canary + the holding protections).
+  (`new_in_memory` — the deliberate local-read decision), `crates/droplet-core/src/security/`
+  (the canary + the holding protections; the 2026-06-26 adversarial suite, with findings in
+  `docs/security/2026-06-25-adversarial-suite-findings.md`).
 - Roadmap: `docs/superpowers/specs/2026-06-17-roadmap-replan-design.md` §4 (V3); the V1a plan
   `docs/superpowers/plans/2026-06-24-v1a-walking-skeleton.md` ("deliberately does NOT do").
 - Spec: PRODUCT.md §6 (LOAD boundary), §7 (analyze is unrestricted-but-local), §14 (isolation & safety),
