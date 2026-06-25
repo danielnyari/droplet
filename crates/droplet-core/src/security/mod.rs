@@ -24,6 +24,7 @@ mod sql_injection;
 mod handles_args;
 mod result_cap;
 mod error_safety;
+mod memory_safety;
 
 /// A unique temp dir per tag so fixtures never collide.
 pub(crate) fn tmp_dir(tag: &str) -> std::path::PathBuf {
