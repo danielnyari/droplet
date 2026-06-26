@@ -54,11 +54,33 @@ fn session_limits() -> ResourceLimits {
         .max_memory(256 * 1024 * 1024)
 }
 
+/// Reduce a host-supplied (untrusted) `run_id` to a SINGLE safe path component, so the work dir can
+/// neither escape (`../`) nor nest below `temp_dir()`. Path separators are split on and `.`/`..`/empty
+/// segments dropped: `../../tmp/evil` flattens to `tmp_evil`, `a/b/c` to `a_b_c`. Other bytes pass
+/// through unchanged (incl. NUL and over-long names) so the OS still rejects a genuinely illegal name
+/// as a clean `io::Error` rather than it being silently masked. `run_id` is kept verbatim as metadata.
+fn sanitize_run_id(run_id: &str) -> String {
+    run_id
+        .split(['/', '\\'])
+        .filter(|seg| !matches!(*seg, "" | "." | ".."))
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 impl Session {
     pub fn new(run_id: &str) -> Result<Self, DropletError> {
-        // Unique per run so two sessions never collide (§14 isolation).
-        let work_dir = std::env::temp_dir().join(format!("droplet-{run_id}"));
-        // Wipe any stale dir from a previous run, then recreate it empty.
+        // run_id is host/SDK-supplied and untrusted: flatten it to one in-temp component (no `../`
+        // escape, no nesting) and append a process-unique sequence so two sessions sharing a run_id
+        // get DISTINCT dirs — neither can wipe the other (§14 isolation).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT_SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let safe = sanitize_run_id(run_id);
+        let work_dir =
+            std::env::temp_dir().join(format!("droplet-{safe}-{}-{seq}", std::process::id()));
+        // Unique per instance, so this remove is normally a no-op; kept as a backstop against an
+        // astronomically unlikely pid+seq reuse. sanitize_run_id guarantees a single in-temp
+        // component, so it can never target a dir outside temp_dir.
         let _ = fs::remove_dir_all(&work_dir); // ignore "not found"
         fs::create_dir_all(&work_dir)?; // io::Error -> DropletError via #[from]
         // Default the connector to the local-Parquet dev impl, looking in the
