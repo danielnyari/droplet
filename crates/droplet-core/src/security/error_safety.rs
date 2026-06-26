@@ -307,26 +307,26 @@ fn run_code_never_panics_under_a_burst_of_mixed_errors() {
     );
 }
 
-/// `CANARY` (was PROBE → FINDING)
-// FINDING: the macro thunk's `&args[i]` direct indexing has NO arity guard.
-// When monty forwards a zero-arg call to `to_rows` (expects 1 arg), the thunk hits `&args[0]`
-// on an empty slice and panics with "index out of bounds: the len is 0 but the index is 0"
-// (tools.rs:122). This panic unwinds through the dispatch path — a host-side crash reachable
-// from agent code. Fix: add arity guard in the #[droplet_tool] macro thunk before any &args[i].
-// INTENT (original PROBE): under-arity tool call must NOT panic on args[i] out-of-bounds indexing.
-/// seam: macros/src/lib.rs thunk: `&args[#indices]` direct indexing with NO arity guard; zero-arg call panics host
+/// `HOLDS` (was CANARY → FINDING; arity gap FIXED 2026-06-26)
+// FIX: the #[droplet_tool] macro thunk now validates arity BEFORE any `&args[i]`. A zero-arg call
+// to `to_rows` (expects 1 arg) is a contained BadArg, not an out-of-bounds host panic. The BadArg
+// propagates through the dispatch path exactly like a type mismatch, consuming the REPL (the next
+// call is then a clean NotFound). A run_code call that previously panicked would fail this test by
+// unwinding it, so a direct call (no catch_unwind) is sufficient to prove the panic is gone.
+/// seam: macros/src/lib.rs thunk arity guard -> BadArg through session.rs dispatch (no host panic)
 #[test]
-fn known_gap_under_arity_panics_host_via_oob_indexing() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    // FINDING: Monty forwards the short arg list unchanged; the thunk panics on &args[0] OOB.
-    let res = catch_unwind(AssertUnwindSafe(|| {
-        let mut s = Session::new("err-underarity").unwrap();
-        // to_rows expects (ds); call it with ZERO args -> thunk hits &args[0] on an empty slice.
-        let _e1 = s.run_code("to_rows()");
-    }));
+fn under_arity_through_run_code_is_contained_bad_arg() {
+    let mut s = Session::new("err-underarity").unwrap();
+    // to_rows expects (ds); call it with ZERO args -> arity guard returns BadArg, no OOB panic.
+    let e1 = s.run_code("to_rows()");
+    let e2 = s.run_code("1 + 1");
     assert!(
-        res.is_err(),
-        "CANARY: under-arity tool call PANICS the host (args[i] OOB in dispatch thunk, tools.rs:122) — this is the known gap; if this assertion flips to Ok the gap is fixed"
+        matches!(e1, Err(DropletError::BadArg(_))),
+        "under-arity tool call must be a contained BadArg, not a host panic, got {e1:?}"
+    );
+    assert!(
+        matches!(e2, Err(DropletError::NotFound(_))),
+        "the arity BadArg consumes the REPL -> next call is a clean NotFound, got {e2:?}"
     );
 }
 
@@ -349,32 +349,27 @@ fn over_arity_extra_args_ignored_or_clean_err_no_panic() {
     );
 }
 
-/// `CANARY` (was PROBE → ⭐ HIGH-SEVERITY FINDING)
-// ⭐ ARITY-THROUGH-RUN_CODE RESULT: PANIC — HIGH SEVERITY
-// FINDING: Monty does NOT pre-validate arity before forwarding args to the host dispatch thunk.
-// `query('/tmp/x.parquet')` (1 arg to a 2-arg tool) reaches session.rs FunctionCall arm
-// (which has NO catch_unwind), enters the macro thunk, and panics with
-// "index out of bounds: the len is 1 but the index is 1" (tools.rs:22).
-// The panic unwinds straight through run_code into the host, and — via PyO3 — would abort
-// the Python process. An agent can crash the host with a single wrong-arity tool call.
-// Fix: add arity guard in the #[droplet_tool] macro thunk (macros/src/lib.rs) OR add
-// catch_unwind in session.rs FunctionCall arm (session.rs:113).
-// INTENT (original PROBE): wrong-arity call through run_code must surface a contained DropletError.
-/// seam: session.rs:113 FunctionCall arm (no catch_unwind) + macro thunk &args[i] OOB = host panic from agent code
+/// `HOLDS` (was CANARY → ⭐ HIGH-SEVERITY FINDING; arity gap FIXED 2026-06-26)
+// ⭐ ARITY-THROUGH-RUN_CODE: was a host panic, now a contained BadArg.
+// FIX: the #[droplet_tool] macro thunk validates arity before any `&args[i]`. `query('/tmp/x.parquet')`
+// (1 arg to a 2-arg tool) now reaches the thunk, fails the arity check, and returns BadArg, which
+// propagates through the session.rs FunctionCall arm as an ordinary DropletError — no out-of-bounds
+// panic crosses run_code (and thus none reaches the PyO3 boundary). The BadArg consumes the REPL, so
+// the next call is a clean NotFound. Had run_code still panicked, it would unwind this test directly.
+/// seam: macros/src/lib.rs thunk arity guard -> BadArg through session.rs FunctionCall arm (no host panic)
 #[test]
-fn known_gap_wrong_arity_through_run_code_panics_host() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    // FINDING: Monty forwards the 1-element arg list unchanged; thunk's &args[1] panics OOB.
-    // The panic crosses the run_code boundary (no catch_unwind in FunctionCall arm).
-    let res = catch_unwind(AssertUnwindSafe(|| {
-        let mut s = crate::session::Session::new("err-arity-runcode").unwrap();
-        // Agent code calls the 2-arg `query` tool with ONE positional arg, THROUGH the real suspend/resume
-        // FunctionCall arm (session.rs:113 has NO catch_unwind). Monty forwards the short arg list,
-        // the macro thunk's `&args[1]` (tools.rs:22) panics, unwinds straight through run_code into the host.
-        let _e1 = s.run_code("query('/tmp/x.parquet')");
-    }));
+fn wrong_arity_through_run_code_is_contained_bad_arg() {
+    let mut s = crate::session::Session::new("err-arity-runcode").unwrap();
+    // Agent code calls the 2-arg `query` tool with ONE positional arg, THROUGH the real suspend/resume
+    // FunctionCall arm. The arity guard returns BadArg before `&args[1]` is ever indexed.
+    let e1 = s.run_code("query('/tmp/x.parquet')");
+    let e2 = s.run_code("1 + 1");
     assert!(
-        res.is_err(),
-        "CANARY: wrong-arity tool call through run_code PANICS the host (tools.rs:22 &args[1] OOB, no catch_unwind in FunctionCall arm) — HIGH SEVERITY: agent can abort the host; if this flips to Ok the gap is fixed"
+        matches!(e1, Err(DropletError::BadArg(_))),
+        "wrong-arity tool call through run_code must be a contained BadArg, not a host panic, got {e1:?}"
+    );
+    assert!(
+        matches!(e2, Err(DropletError::NotFound(_))),
+        "the arity BadArg consumes the REPL -> next call is a clean NotFound, got {e2:?}"
     );
 }
