@@ -17,7 +17,17 @@ mod tests {
     /// FINDING: Session::new creates a work_dir OUTSIDE temp_dir via run_id traversal (confirmed on macOS).
     /// Pinning OBSERVED behavior: Session::new returns Ok and work_dir canonicalizes to /private/var/tmp/droplet-evil-traversal-probe (outside temp_dir).
     /// seam: session.rs Session::new — temp_dir().join(format!("droplet-{run_id}")) + create_dir_all; path traversal via run_id
+    // Platform-gated: this CANARY's payload is tuned to macOS path semantics (temp_dir lives under
+    // /var/folders/... and `/tmp` -> `/private/tmp`, so `../../tmp/...` escapes temp_dir). On Linux
+    // temp_dir IS `/tmp`, so the same run_id resolves back *inside* it and the escape assert can't
+    // hold — it would false-fail, not catch a regression. The F-3 run_id-traversal gap is STILL OPEN
+    // on both platforms (Session::new does not sanitize run_id); a cross-platform pin + the real fix
+    // (sanitize_run_id) are tracked separately, out of scope for this F-1 change.
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "macOS-only path semantics; F-3 gap still open, cross-platform pin tracked separately"
+    )]
     fn known_gap_run_id_dotdot_traversal_creates_dir_outside_temp_dir() {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let run_id = "../../../../../../tmp/droplet-evil-traversal-probe";
@@ -52,7 +62,15 @@ mod tests {
     /// FINDING: Session::new's remove_dir_all deletes a directory OUTSIDE temp_dir when run_id contains path traversal.
     /// Pinning OBSERVED behavior: keepme.txt in the victim dir is deleted by Session::new's internal remove_dir_all.
     /// seam: session.rs Session::new — `let _ = fs::remove_dir_all(&work_dir)` runs BEFORE create; destructive arbitrary-dir deletion
+    // Platform-gated for the same reason as the creation canary above: the victim is planted at
+    // `/var/tmp` to collide with where the run_id resolves on macOS; on Linux the run_id resolves to
+    // `/tmp/...` instead, so the victim is never touched and `keepme.txt` survives — a false-fail, not
+    // a real regression. F-3 remains open on both platforms; tracked separately.
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "macOS-only path semantics; F-3 gap still open, cross-platform pin tracked separately"
+    )]
     fn known_gap_run_id_traversal_removes_dir_outside_temp_dir() {
         // CRITICAL: plant the victim where the traversing run_id ACTUALLY resolves.
         // On macOS the run_id below resolves to /var/tmp (canon /private/var/tmp), NOT /tmp (which is /private/tmp).
