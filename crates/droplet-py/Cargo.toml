@@ -1,0 +1,19 @@
+[package]
+name = "droplet-py"
+edition.workspace    = true
+version.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+name       = "_droplet"        # compiled module name -> imported as droplet._droplet
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3.workspace = true
+# The PyO3 firewall binds to the pure-Rust core (invariant #8: pyo3 lives ONLY here, never in
+# droplet-core). droplet-core pulls in DuckDB, so building the wheel now compiles the engine too.
+droplet-core = { path = "../droplet-core" }
+# droplet-py converts run_code's MontyObject result into Python, so it names monty directly.
+# (Invariant #8 bars pyo3 from droplet-core, not monty from droplet-py.) Same pinned monty.
+monty.workspace = true

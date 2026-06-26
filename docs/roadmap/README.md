@@ -149,9 +149,16 @@ post will lead you astray. A few traps worth knowing up front:
   crate pins a specific `arrow` major (currently `58`), and the latest `arrow` on
   crates.io is newer (`59`). **Don't add `arrow` yourself blindly** — use the
   `duckdb::arrow` re-export; `M1` walks you through this and `cargo tree -i arrow`.
-- **PyO3** renamed `Python::allow_threads` → `Python::detach` in 0.26 with **no
-  deprecated alias**, so any tutorial using `allow_threads` won't compile against
-  the pinned `0.29`. (Likewise `with_gil` → `attach`.)
+- **PyO3** is pinned to **`0.28`** (NOT `0.29`): monty `v0.0.18` transitively pulls
+  pyo3 `0.28.x` via its `jiter` dep, and `pyo3-ffi` declares `links = "python"`,
+  which lets only **one** pyo3 version exist graph-wide — so the whole workspace
+  must match monty's. (`0.29` in `droplet-py` fails with a `pyo3-ffi ... links
+  python` conflict.) Also: the `extension-module` feature is **deprecated and
+  dropped** (it disables libpython linking and breaks `cargo test`/workspace
+  builds — maturin builds the extension module itself). The GIL teaching still
+  holds on `0.28`: pyo3 renamed `Python::allow_threads` → `Python::detach` in 0.26
+  with **no** deprecated alias, so any tutorial using `allow_threads` won't compile
+  (likewise `with_gil` → `attach`).
 - **Proc-macros are advanced Rust** and you don't meet them until **`M4`** — when
   you do, that file gives you a from-scratch intro. Don't worry about them before
   then; in `M3` you wire the tool surface up *by hand* first, precisely so you can
@@ -216,10 +223,14 @@ file reminds you with a **⚠️ Invariant** note when one is relevant.
    data is content-addressed in the object store (S3); mutable coordination (run
    registry, leases, cache index) is in the consistent store (Redis/DynamoDB).
    Resume is **lease-guarded**; no pod affinity.
-8. **Keep Python out of the core.** `droplet-core` (pure Rust) must **never** depend
-   on `pyo3`; the Python bridge lives only in `droplet-py`. The core depends on
+8. **Keep Python out of the core.** `droplet-core` (pure Rust) must **never** write
+   `pyo3` code; the Python bridge lives only in `droplet-py`. The core depends on
    `monty` + engines, **never** on an agent framework (pydantic-ai glue lives in a
-   separate adapter package).
+   separate adapter package). *(Caveat at monty `v0.0.18`: pyo3 appears
+   **transitively** in `droplet-core`'s tree via monty's `jiter` dep — so this rule
+   means "`droplet-core` writes no pyo3 code / never `use`s pyo3", not "pyo3 is
+   absent from the lockfile". It becomes literally absent only when monty drops the
+   `jiter`→pyo3 dep.)*
 9. **DuckDB is synchronous → wrap it in `spawn_blocking` and release the GIL**
    (`py.detach(...)`) while a query runs, so you don't freeze the async runtime or
    block other Python threads.

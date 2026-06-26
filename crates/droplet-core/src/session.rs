@@ -1,0 +1,453 @@
+//! `Session` — the per-run context (PRODUCT.md §14 isolation).
+//!
+//! One run = one `Session`. It owns a unique working directory (wiped on close)
+//! and the handle registry. The ephemeral DuckDB connection, the read-only
+//! Surreal handle, and the deferred store backends get added in later milestones.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use monty::{
+    ExtFunctionResult, LimitedTracker, MontyObject, MontyRepl, NameLookupResult, PrintWriter,
+    ReplProgress, ReplStartError, ResourceLimits,
+};
+
+use crate::DropletError;
+use crate::engine_duckdb::Dataset;
+use crate::registry::Registry;
+use crate::source::{LocalParquetSource, Source};
+use crate::tool::{Tool, ToolCx};
+
+pub struct Session {
+    run_id: String,
+    work_dir: PathBuf,
+    // The per-session handle store: `Dataset`s live host-side here (invariant #6) while the sandbox
+    // holds only the opaque integer handles the tools hand back. Wired into `ToolCx` for run_code.
+    handles: Registry<Dataset>,
+    // The connector seam (invariant #1): any backend plugs in unchanged.
+    // Dev impl now; Athena/S3 later (M6).
+    source: Box<dyn Source>,
+    // The per-session local analyze engine (M1). Host-side behind the boundary — the sandbox
+    // never sees it (invariant #6). One ephemeral in-memory DuckDB per Session (invariant #3).
+    duck: crate::engine_duckdb::DuckEngine,
+    // The session's persistent Monty REPL — agent code across run_code steps shares this namespace
+    // (invariant #8: monty is fine in core; only pyo3 is barred). Held in an Option so run_code can
+    // take it out for the duration of a step and put it back on Complete.
+    // SWAPPED (Task 2): a session-lifetime resource budget bounds agent allocation/memory bombs.
+    repl: Option<MontyRepl<LimitedTracker>>,
+    // Later milestones add (NOT in M0/M1):
+    //   surreal: read-only Surreal<Mem>      // M9 — schema-derived field search (read-only)
+    //   artifacts: Box<dyn ArtifactStore>    // M5 — content-addressed load cache
+    //   coord:     Box<dyn CoordinationStore>// M7 — run registry / leases / cache index
+    //   snapshots: Box<dyn SnapshotStore>    // M8 — REPL+manifest blobs
+}
+
+/// The per-session resource budget. BOTH limits are load-bearing: object fan-out is count-gated
+/// (`on_allocate` → `max_allocations`), list/dict growth is memory-gated (`on_grow` → `max_memory`).
+/// Recursion is already capped at 1000 by `ResourceLimits::new()`.
+/// ponytail: one tracker for the whole session lifetime (a per-`run_code` reset is the upgrade path
+/// if long-lived sessions exhaust the budget); a wall-clock `max_duration` is deferred (see the
+/// pure-CPU-spin watchdog canaries) until a host-interruptible time limit is needed.
+fn session_limits() -> ResourceLimits {
+    ResourceLimits::new()
+        .max_allocations(5_000_000)
+        .max_memory(256 * 1024 * 1024)
+}
+
+impl Session {
+    pub fn new(run_id: &str) -> Result<Self, DropletError> {
+        // Unique per run so two sessions never collide (§14 isolation).
+        let work_dir = std::env::temp_dir().join(format!("droplet-{run_id}"));
+        // Wipe any stale dir from a previous run, then recreate it empty.
+        let _ = fs::remove_dir_all(&work_dir); // ignore "not found"
+        fs::create_dir_all(&work_dir)?; // io::Error -> DropletError via #[from]
+        // Default the connector to the local-Parquet dev impl, looking in the
+        // session's own work_dir. M2's catalog decides this properly.
+        let source: Box<dyn Source> = Box::new(LocalParquetSource::new(work_dir.clone()));
+        // One ephemeral in-memory DuckDB per Session, built right after the work dir.
+        // `?` folds duckdb::Error into DropletError (invariant #10).
+        let duck = crate::engine_duckdb::DuckEngine::new_in_memory()?;
+        // One persistent REPL per session, bounded by a session-lifetime resource budget.
+        let repl = Some(MontyRepl::new(
+            "session.py",
+            LimitedTracker::new(session_limits()),
+        ));
+        Ok(Self {
+            run_id: run_id.to_string(),
+            work_dir,
+            handles: Registry::new(),
+            source,
+            duck,
+            repl,
+        })
+    }
+
+    /// Borrow the session's local analyze engine (host-side; invariant #6). Use this for the
+    /// read-out primitives (`to_rows`, `scalar_*`), which take `&self`.
+    pub fn duck(&self) -> &crate::engine_duckdb::DuckEngine {
+        &self.duck
+    }
+
+    /// Mutably borrow the session's analyze engine. Required for the dataset-producing
+    /// primitives (`register_parquet`, `filter_rows`, `group_agg`, `local_sql`), which take
+    /// `&mut self` because they mint a new `ds_{n}` view. Without this the session-owned engine
+    /// would be unusable for its actual purpose.
+    pub fn duck_mut(&mut self) -> &mut crate::engine_duckdb::DuckEngine {
+        &mut self.duck
+    }
+
+    /// Run one agent program in the session's Monty sandbox to completion, returning the value of
+    /// its last expression. External-function calls suspend the sandbox; the host dispatches them by
+    /// name to the `#[droplet_tool]`-registered tools (run against this session's local engine) and
+    /// resumes (PRODUCT.md §8 execution model; invariant #6 keeps results capped & data host-side).
+    ///
+    /// A recoverable agent error (undefined name, syntax error, calling an unregistered tool) raises
+    /// in the sandbox: `run_code` returns an `Err` but the session's REPL SURVIVES — the next call
+    /// runs against the same namespace (monty hands the REPL back via `ReplStartError`). A hard
+    /// tool/engine error (e.g. bad SQL inside `query`) instead consumes the REPL; a subsequent
+    /// `run_code` then returns a clean `DropletError`, never panics — make a new `Session`.
+    pub fn run_code(&mut self, code: &str) -> Result<MontyObject, DropletError> {
+        let repl = self.repl.take().ok_or_else(|| {
+            DropletError::NotFound("session REPL consumed by a prior failed run".into())
+        })?;
+        let mut progress = self.settle(repl.feed_start(code, vec![], PrintWriter::Disabled))?;
+        loop {
+            match progress {
+                ReplProgress::Complete { repl, value } => {
+                    self.repl = Some(repl); // put it back for the next run_code step
+                    return Ok(value);
+                }
+                ReplProgress::FunctionCall(call) => {
+                    let reply: ExtFunctionResult =
+                        match inventory::iter::<Tool>().find(|t| t.name == call.function_name) {
+                            Some(tool) => {
+                                let mut cx = ToolCx {
+                                    engine: &mut self.duck,
+                                    handles: &mut self.handles,
+                                };
+                                (tool.dispatch)(&mut cx, &call.args, &call.kwargs)?.into()
+                            }
+                            None => ExtFunctionResult::NotFound(call.function_name.clone()),
+                        };
+                    progress = self.settle(call.resume(reply, PrintWriter::Disabled))?;
+                }
+                // Safe defaults for suspension kinds V1a doesn't use (carried from the M0 seam).
+                ReplProgress::OsCall(c) => {
+                    progress = self.settle(c.resume(MontyObject::None, PrintWriter::Disabled))?;
+                }
+                ReplProgress::NameLookup(l) => {
+                    progress =
+                        self.settle(l.resume(NameLookupResult::Undefined, PrintWriter::Disabled))?;
+                }
+                ReplProgress::ResolveFutures(f) => {
+                    let results: Vec<(u32, ExtFunctionResult)> = f
+                        .pending_call_ids()
+                        .iter()
+                        .map(|&id| (id, ExtFunctionResult::Return(MontyObject::None)))
+                        .collect();
+                    progress = self.settle(f.resume(results, PrintWriter::Disabled))?;
+                }
+            }
+        }
+    }
+
+    /// Fold a feed/resume result into the boundary error type, RESTORING the surviving REPL on error
+    /// (monty's `ReplStartError` carries it) so a raised exception doesn't poison the session.
+    fn settle(
+        &mut self,
+        r: Result<ReplProgress<LimitedTracker>, Box<ReplStartError<LimitedTracker>>>,
+    ) -> Result<ReplProgress<LimitedTracker>, DropletError> {
+        r.map_err(|e| {
+            let ReplStartError { repl, error } = *e;
+            self.repl = Some(repl);
+            DropletError::Monty(error)
+        })
+    }
+
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Borrow the session's handle registry (host-side `Dataset`s behind opaque handles).
+    pub fn handles(&self) -> &Registry<Dataset> {
+        &self.handles
+    }
+
+    /// Borrow the session's connector (the only thing that touches a source).
+    pub fn source(&self) -> &dyn Source {
+        self.source.as_ref()
+    }
+
+    /// Consume the session and surface a teardown error, for callers who want
+    /// the wipe to be loud rather than best-effort. `Drop` still runs as a
+    /// backstop if you don't call this.
+    pub fn close(self) -> Result<(), DropletError> {
+        fs::remove_dir_all(&self.work_dir)?;
+        Ok(())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Best-effort cleanup; never panic in a destructor.
+        let _ = fs::remove_dir_all(&self.work_dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write `sales.parquet` (region:str, amt:DOUBLE). `amt` is cast to DOUBLE: a decimal literal is
+    /// DECIMAL in DuckDB and `SUM` widens to Decimal128, which the capped read-out can't decode yet.
+    fn write_sales_parquet(dir: &std::path::Path) -> String {
+        let path = dir.join("sales.parquet");
+        let p = path.to_str().unwrap().to_string();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT region, amt::DOUBLE AS amt \
+             FROM (VALUES ('EU', 100.0), ('EU', 50.0), ('US', 200.0)) AS t(region, amt)) \
+             TO '{p}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+        p
+    }
+
+    /// FIRST WORKING DROPLET (pure Rust): agent code in the Monty sandbox calls the macro-generated
+    /// `query` tool and gets the real aggregates back into its own code. This is V1a's "Done when".
+    #[test]
+    fn run_code_runs_agent_program_against_local_parquet() -> Result<(), DropletError> {
+        let dir = std::env::temp_dir().join("droplet-v1a-runcode-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_sales_parquet(&dir);
+
+        let mut session = Session::new("run-v1a")?;
+        // The agent's program: query -> print -> leave `rows` as the final expression so its value
+        // crosses back as the run_code result (proving the aggregates reached the agent's code).
+        let code = format!(
+            "rows = query({path:?}, 'SELECT region, SUM(amt) AS t FROM data GROUP BY region')\n\
+             print(rows)\n\
+             rows"
+        );
+        let value = session.run_code(&code)?;
+
+        let MontyObject::List(items) = value else {
+            panic!("expected list[dict], got {value:?}");
+        };
+        let mut got = std::collections::BTreeMap::new();
+        for it in items {
+            let MontyObject::Dict(pairs) = it else {
+                panic!()
+            };
+            let (mut region, mut t) = (None, None);
+            for (k, v) in pairs.clone() {
+                if let MontyObject::String(k) = k {
+                    match (k.as_str(), v) {
+                        ("region", MontyObject::String(s)) => region = Some(s),
+                        ("t", MontyObject::Float(f)) => t = Some(f),
+                        _ => {}
+                    }
+                }
+            }
+            got.insert(region.unwrap(), t.unwrap());
+        }
+        assert_eq!(got.get("EU"), Some(&150.0));
+        assert_eq!(got.get("US"), Some(&200.0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A call to a name that is not a registered tool must surface an error, not panic.
+    #[test]
+    fn run_code_unknown_tool_errors() {
+        let mut session = Session::new("run-v1a-unknown").unwrap();
+        let err = session.run_code("not_a_real_tool(1)");
+        assert!(err.is_err(), "unknown tool must produce an error");
+    }
+
+    /// Three regions for a richer analyze demo (region:str, amt:DOUBLE).
+    /// Grouped: EU total 150 / n 2 / avg 75; US 200 / 1 / 200; APAC 300 / 2 / 150.
+    fn write_demo_parquet(dir: &std::path::Path) -> String {
+        let path = dir.join("demo.parquet");
+        let p = path.to_str().unwrap().to_string();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT region, amt::DOUBLE AS amt FROM (VALUES \
+             ('EU', 100.0), ('EU', 50.0), ('US', 200.0), ('APAC', 300.0), ('APAC', 0.0)) \
+             AS t(region, amt)) TO '{p}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+        p
+    }
+
+    /// V1b "Done when": a multi-step analysis program over LOCAL handles — register → group_agg →
+    /// to_rows → the agent's own Python derives an average, BRANCHES on a threshold, and RANKS —
+    /// with rows crossing only at `to_rows` (everything else is a handle). The §20 analyze shape,
+    /// local-only (no load/cache/cross-pod yet).
+    #[test]
+    fn multi_step_analysis_over_handles() -> Result<(), DropletError> {
+        let dir = std::env::temp_dir().join("droplet-v1b-demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_demo_parquet(&dir);
+
+        let mut session = Session::new("run-v1b")?;
+        let code = [
+            format!("ds = register({path:?})"),
+            "agg = group_agg(ds, ['region'], [('total','SUM(amt)'), ('n','CAST(COUNT(*) AS BIGINT)')])"
+                .to_string(),
+            "ranked = []".to_string(),
+            "for r in to_rows(agg):".to_string(),
+            "    avg = r['total'] / r['n']".to_string(),
+            "    if avg >= 100:".to_string(),
+            "        ranked.append({'region': r['region'], 'avg': avg})".to_string(),
+            "ranked.sort(key=lambda x: -x['avg'])".to_string(),
+            "ranked".to_string(),
+        ]
+        .join("\n");
+
+        let value = session.run_code(&code)?;
+        // EU avg 75 dropped (<100); US 200 and APAC 150 kept, ranked descending.
+        let MontyObject::List(items) = value else {
+            panic!("expected ranked list, got {value:?}");
+        };
+        let ranked: Vec<(String, f64)> = items
+            .iter()
+            .map(|it| {
+                let MontyObject::Dict(pairs) = it else {
+                    panic!("each ranked entry is a dict")
+                };
+                let (mut region, mut avg) = (None, None);
+                for (k, v) in pairs.clone() {
+                    if let MontyObject::String(k) = k {
+                        match (k.as_str(), v) {
+                            ("region", MontyObject::String(s)) => region = Some(s),
+                            ("avg", MontyObject::Float(f)) => avg = Some(f),
+                            _ => {}
+                        }
+                    }
+                }
+                (region.unwrap(), avg.unwrap())
+            })
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![("US".to_string(), 200.0), ("APAC".to_string(), 150.0)]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Boundary discipline (invariant #6): handle-producing ops return an opaque integer handle to
+    /// the sandbox, NOT rows. Only `to_rows`/`scalar` move values.
+    #[test]
+    fn intermediate_ops_return_handles_not_rows() -> Result<(), DropletError> {
+        let dir = std::env::temp_dir().join("droplet-v1b-handles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_sales_parquet(&dir);
+
+        let mut session = Session::new("run-v1b-handles")?;
+        // register and group_agg each return a handle (an int), not a list of rows.
+        let h = session.run_code(&format!("register({path:?})"))?;
+        assert!(
+            matches!(h, MontyObject::Int(_)),
+            "register returns a handle"
+        );
+        let g = session.run_code(&format!(
+            "group_agg(register({path:?}), ['region'], [('t','SUM(amt)')])"
+        ))?;
+        assert!(
+            matches!(g, MontyObject::Int(_)),
+            "group_agg returns a handle, not rows"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Handles persist across `run_code` steps: a dataset registered in one step is usable in the
+    /// next (same Monty namespace + same session handle registry).
+    #[test]
+    fn handles_persist_across_run_code_steps() -> Result<(), DropletError> {
+        let dir = std::env::temp_dir().join("droplet-v1b-persist");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_sales_parquet(&dir);
+
+        let mut session = Session::new("run-v1b-persist")?;
+        session.run_code(&format!("ds = register({path:?})"))?; // step 1: handle bound to `ds`
+        let rows = session.run_code("to_rows(filter_rows(ds, 'amt > 60'))")?; // step 2: reuse `ds`
+        // amt>60 keeps EU 100 and US 200 (EU's 50 dropped) -> 2 rows.
+        let MontyObject::List(items) = rows else {
+            panic!("expected rows from step 2");
+        };
+        assert_eq!(
+            items.len(),
+            2,
+            "the handle from step 1 must still resolve in step 2"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn new_creates_a_fresh_work_dir() {
+        let s = Session::new("run-123").unwrap();
+        assert!(s.work_dir().is_dir()); // the dir exists on disk
+    }
+
+    #[test]
+    fn drop_wipes_the_work_dir() {
+        let path = {
+            let s = Session::new("run-drop").unwrap();
+            s.work_dir().to_path_buf()
+        }; // session dropped here
+        assert!(!path.exists(), "Drop should have wiped {path:?}");
+    }
+
+    #[test]
+    fn session_owns_a_live_duck_engine() {
+        // Session::new returning Ok already proves Connection::open_in_memory()
+        // succeeded (it is built with `?` inside new). Reaching `s.duck()` proves
+        // the engine lives behind the session boundary (invariant #6: host-side).
+        let s = Session::new("run-duck").unwrap();
+        let _engine: &crate::engine_duckdb::DuckEngine = s.duck();
+    }
+
+    /// The session-owned engine must be USABLE for analysis, not just readable: the
+    /// dataset-producing primitives take `&mut self`, so the session needs `duck_mut()`.
+    /// (Fails before `duck_mut` exists — the engine would be effectively write-only.)
+    #[test]
+    fn session_engine_is_usable_for_analysis() -> Result<(), DropletError> {
+        let mut s = Session::new("run-duck-mut")?;
+        let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
+        let ds = s.duck_mut().register_parquet(&path)?;
+        assert_eq!(s.duck().scalar_i64(&ds, "SUM(amount)")?, 790);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_carries_a_working_connector() {
+        use crate::source::LoadRequest;
+
+        let s = Session::new("run-src").unwrap();
+        // The dev connector looks in work_dir for <dataset>.parquet.
+        let file = s.work_dir().join("orders.parquet");
+        std::fs::write(&file, b"PAR1...not-real-parquet...").unwrap();
+
+        let got = s
+            .source()
+            .load(&LoadRequest {
+                dataset: "orders".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, file);
+        assert!(got.exists());
+    }
+}

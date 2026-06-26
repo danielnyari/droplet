@@ -1,10 +1,46 @@
-
 [workspace]
-resolver = "3"                
-members = ["crates/droplet-core", "droplet-warmup"]
+resolver = "3"
+members = ["crates/droplet-core", "crates/droplet-macros", "crates/droplet-py", "xtask"]
 
-[workspace.package]            
-edition = "2024"
-version = "0.0.1"
-license = "MIT"
+[workspace.package]
+edition    = "2024"
+version    = "0.0.1"
+license    = "MIT"
 repository = "https://github.com/you/droplet"
+
+[workspace.dependencies]
+thiserror   = "2.0.18"
+serde       = { version = "1.0.228", features = ["derive"] }
+async-trait = "0.1.89"
+tokio       = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+# Pinned to 0.28 (NOT 0.29): monty v0.0.18 transitively pulls pyo3 0.28.x via
+# `jiter`, and pyo3-ffi `links = "python"` allows only ONE pyo3 version in the
+# graph — so droplet-py must match monty's.
+# The `extension-module` feature is deprecated (it disables libpython linking and
+# breaks `cargo test`/workspace builds). maturin >= 1.9.4 builds the extension
+# module itself (via PYO3_BUILD_EXTENSION_MODULE), so plain cargo links libpython.
+pyo3        = { version = "0.28", features = ["abi3-py310"] }
+# Pinned to a git TAG (crates.io `monty` 0.0.0 is an unrelated placeholder).
+# Pre-1.0; the API churns. First build is long (pulls ty/ruff/salsa).
+monty       = { git = "https://github.com/pydantic/monty", tag = "v0.0.18" }
+anyhow      = "1.0.102"   # binaries only (invariant #10); libraries use thiserror
+# DuckDB = the LOCAL analyze engine (M1). Version scheme is NOT plain semver:
+# `1.<engine-major><minor 2d><patch 2d>.<crate-patch>` — so 1.10503.1 == DuckDB v1.5.3.
+# Engine upgrades are deliberate: the Cargo.lock pins the exact version; bumping needs `cargo update`.
+# BUILD PATH: using `bundled` for zero-setup (Cargo compiles DuckDB's C++ — slow first build, minutes).
+# If first-build time hurts, revisit a prebuilt lib (DUCKDB_DOWNLOAD_LIB=1) against the MATCHING upstream
+# version BEFORE reaching for the stale `frozen-duckdb` (0.1.0 targets an OLDER DuckDB; PRODUCT.md §18).
+# NO httpfs/S3 here — that's M6. Do NOT add a top-level `arrow` dep — use the `duckdb::arrow` re-export.
+duckdb      = { version = "1.10503.1", features = ["bundled", "parquet", "json"] }
+# The #[droplet_tool] proc-macro (V1a). syn parses the Rust fn signature; quote builds the
+# generated Monty dispatch thunk + .pyi stub; proc-macro2 is the token type they share.
+syn         = { version = "2", features = ["full"] }
+quote       = "1"
+proc-macro2 = "1"
+# Link-time collection of every #[droplet_tool] into one dispatch table — invariant #4's
+# "no hand-maintained registry". verify: 0.3.x resolves; survives into the cdylib (Task 7).
+inventory   = "0.3"
+# droplet-macros is a path member; referenced by droplet-core below.
+droplet-macros = { path = "crates/droplet-macros" }
+# num-bigint: direct dep for test-only BigInt construction (matches monty's transitive version).
+num-bigint  = "0.4"

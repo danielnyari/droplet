@@ -1,0 +1,39 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # droplet-py links libpython (pyo3 without the deprecated extension-module
+      # feature), so the build needs a Python available to link against.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Cache the cargo registry + target dir so the bundled DuckDB C++ engine (slow, minutes)
+      # is reused across runs instead of recompiled every time.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      # DuckDB is now an always-on core dependency, so the workspace steps below exercise the
+      # analyze engine directly — no separate `--features duckdb` pass. First run compiles
+      # bundled DuckDB (~3 min); the rust-cache above makes later runs fast.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      # RUST_MIN_STACK: belt-and-suspenders for the adversarial recursion canaries. They already run on a
+      # 16 MiB `run_big_stack` thread (security/dos_limits.rs, memory_safety.rs), but a larger default stack
+      # protects any debug-build deep-recursion path from a native stack overflow (monty's depth-1000 cap can
+      # overflow the default stack in debug). The `#[ignore]`d DoS watchdog canaries are NOT run here (they
+      # spin ~3s each by design); run them manually with `cargo test -- --ignored`.
+      - run: RUST_MIN_STACK=16777216 cargo test --workspace
+      # Build the wheel into a venv and run the minimal Python binding test (the `Engine`
+      # vertical slice over the local-Parquet fixture). Reuses the cargo cache above.
+      - name: Python binding test
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip maturin pytest pyarrow
+          maturin develop --manifest-path crates/droplet-py/Cargo.toml
+          pytest -q crates/droplet-py/python/tests

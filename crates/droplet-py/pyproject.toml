@@ -1,0 +1,12 @@
+[build-system]
+requires      = ["maturin>=1.14,<2.0"]
+build-backend = "maturin"
+
+[project]
+name            = "droplet"
+version         = "0.0.1"
+requires-python = ">=3.10"
+
+[tool.maturin]
+python-source = "python"           # mixed project: the `droplet` package lives here
+module-name   = "droplet._droplet" # native lib is placed inside it as `_droplet`
