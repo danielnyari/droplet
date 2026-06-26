@@ -45,9 +45,12 @@ pub fn droplet_tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
         arg_types.push((*pt.ty).clone());
     }
 
-    // The thunk converts args via FromArg, calls the fn (cx passed through if present), and packs the
-    // return via IntoRet. Tools return Result<R, DropletError>, so `?` propagates.
+    // The thunk validates arity, converts args via FromArg, calls the fn (cx passed through if
+    // present), and packs the return via IntoRet. Tools return Result<R, DropletError>, so `?`
+    // propagates. The arity guard runs BEFORE any `&args[i]`, so a wrong-arity call from agent code
+    // is a contained, retryable BadArg — not an out-of-bounds panic that crashes the host.
     let indices: Vec<syn::Index> = (0..arg_idents.len()).map(syn::Index::from).collect();
+    let n_args = arg_idents.len();
     let call = if cx_first {
         quote! { #fn_name(cx, #(#arg_idents),*) }
     } else {
@@ -67,6 +70,14 @@ pub fn droplet_tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
             args: &[::monty::MontyObject],
             _kwargs: &[(::monty::MontyObject, ::monty::MontyObject)],
         ) -> ::core::result::Result<::monty::MontyObject, crate::DropletError> {
+            if args.len() != #n_args {
+                return ::core::result::Result::Err(crate::DropletError::BadArg(
+                    ::std::format!(
+                        "{} expects {} positional arg(s), got {}",
+                        #fn_name_str, #n_args, args.len()
+                    ),
+                ));
+            }
             #( let #arg_idents = <#arg_types as crate::convert::FromArg>::from_arg(cx, &args[#indices])?; )*
             let __ret = #call?;
             ::core::result::Result::Ok(crate::convert::IntoRet::into_ret(__ret, cx))

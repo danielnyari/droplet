@@ -91,6 +91,30 @@ def test_negative_handle_is_bad_arg_runtimeerror(tmp_path):
         session.run_code('to_rows(-1)')
 
 
+# `HOLDS` (was the F-1 host-crash gap; FIXED 2026-06-26) — a wrong-arity tool call through run_code must
+# be a contained, CATCHABLE RuntimeError at the PyO3 boundary, NOT an uncatchable PanicException
+# (panic=unwind) or a SIGABRT (panic=abort). Pre-fix the #[droplet_tool] thunk indexed `&args[1]` with
+# no bounds check, so `query('/x.parquet')` (1 arg to a 2-arg tool) panicked through run_code and crashed
+# the host process — agent-triggerable with a trivial mistake. The macro arity guard now folds it to
+# BadArg -> RuntimeError. `except Exception` must catch it: a PanicException is a BaseException and would
+# escape, failing the test — this is the boundary that actually mattered for the finding.
+# seam: macros/src/lib.rs thunk arity guard -> BadArg -> lib.rs to_pyerr RuntimeError (no PanicException/abort)
+def test_wrong_arity_tool_call_is_catchable_runtimeerror_not_host_crash(tmp_path):
+    # Over/under-arity on a 2-arg tool: `query` takes (path, sql); call with ONE positional arg.
+    session = droplet.Session('fw-arity')
+    try:
+        session.run_code("query('/tmp/x.parquet')")
+        assert False, 'wrong-arity tool call should have raised'
+    except RuntimeError as e:
+        assert str(e)  # carries the BadArg Display message
+    except Exception:
+        assert False, 'must be a contained RuntimeError, not a bare panic/PanicException'
+    # Smallest case: zero args to a 1-arg tool (empty args slice) on a FRESH session.
+    session2 = droplet.Session('fw-arity-empty')
+    with pytest.raises(RuntimeError):
+        session2.run_code('to_rows()')
+
+
 # `HOLDS` — Asserts BOTH the concrete exception class (RuntimeError) AND message presence — distinct from tests that only assert 'raises'.
 # seam: lib.rs to_pyerr: every DropletError -> PyRuntimeError carrying Display; invariant #10 meets Python
 def test_droplet_error_is_catchable_runtimeerror_with_message_invariant10(tmp_path):

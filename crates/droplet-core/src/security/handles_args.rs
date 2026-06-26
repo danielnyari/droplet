@@ -1,7 +1,7 @@
 // crates/droplet-core/src/security/handles_args.rs
 //! Handle/registry forgery + arg-conversion seam + macro arity — adversarial angles.
 //! seam: `convert.rs` FromArg/IntoRet, `registry.rs` Registry, the `#[droplet_tool]` thunk's
-//! `args[i]` direct indexing (no bounds guard) in `macros/src/lib.rs`.
+//! arity guard + `args[i]` indexing in `macros/src/lib.rs`.
 #![allow(unused_imports)]
 use super::{
     catch_dispatch, catch_dispatch_kw, dispatch, list_len, sales_parquet, tmp_dir, write_parquet,
@@ -385,45 +385,36 @@ mod tests {
         );
     }
 
-    // ── Macro arity probes (catch_dispatch / catch_dispatch_kw) ───────────────────────────────────
+    // ── Macro arity guard (catch_dispatch / catch_dispatch_kw) ────────────────────────────────────
     //
-    // The `#[droplet_tool]` macro thunk indexes `args[i]` directly (macros/src/lib.rs:70):
-    //   `let #arg_idents = <#arg_types as FromArg>::from_arg(cx, &args[#indices])?;`
-    // There is NO bounds guard before the index, so a short args slice panics. All four tests below
-    // were originally PROBE (desired contract: no panic, contained Err). After running, all four
-    // observed a PANIC (res.is_err()) → converted to CANARY pinning the observed behavior.
-    // End-to-end reachability (does this panic cross `run_code`?) is tested in the error_safety
-    // class (Task 9).
+    // The `#[droplet_tool]` macro thunk now validates arity BEFORE indexing `args[i]`
+    // (macros/src/lib.rs): `if args.len() != N { return Err(BadArg(..)) }`. The tests below were
+    // originally PROBE (desired contract: no panic, contained Err), became CANARY pinning the
+    // observed panic, and are now HOLDS again — the arity gap was FIXED 2026-06-26, so a wrong-arity
+    // call (under OR over) is a contained BadArg, not a host panic or a silent arg drop.
+    // End-to-end reachability through `run_code` is tested in the error_safety class.
 
-    /// `CANARY` (was PROBE) — FINDING: macro thunk panics on missing arg (args[1] out of bounds).
-    /// OBSERVED: res.is_err() — the thunk panics on the OOB index of args[1] for `query`'s `sql` arg.
-    /// DESIRED CONTRACT: res.is_ok() + inner Err(BadArg) — a contained error, not a host panic.
-    /// FINDING: macros/src/lib.rs:70 thunk `&args[#indices]` direct indexing; no arity guard.
-    /// E2E reachability tested in error_safety (Task 9).
-    /// seam: macros/src/lib.rs:70 thunk `&args[#indices]`; session.rs dispatch has NO catch_unwind
+    /// `HOLDS` (was CANARY → FINDING; arity gap FIXED 2026-06-26) — under-arity at the thunk level.
+    /// The macro arity guard returns BadArg for a 1-arg call to 2-arg `query` (missing `sql`) — no
+    /// panic from indexing args[1], and no engine contact.
+    /// seam: macros/src/lib.rs thunk arity guard runs before `&args[i]`
     #[test]
-    #[allow(non_snake_case)]
-    fn CANARY_query_missing_arg_panics_at_thunk_level() {
-        // DESIRED (when macro gains an arity guard): res.is_ok() && res.unwrap().is_err()
+    fn query_missing_arg_is_contained_bad_arg() {
         let res = catch_dispatch("query", &[MontyObject::String("/tmp/x.parquet".into())]);
+        let inner = res.expect("arity guard must return, not panic, on a missing arg");
         assert!(
-            res.is_err(),
-            "CANARY: macro thunk must panic on missing `sql` arg (args[1] OOB); \
-             if this flips to is_ok() the arity finding is fixed — update to PROBE/HOLDS"
+            matches!(inner, Err(DropletError::BadArg(_))),
+            "missing `sql` arg must be a contained BadArg, got {inner:?}"
         );
     }
 
-    /// `CANARY` (was PROBE) — FINDING: kwargs-only call panics (thunk ignores _kwargs, indexes
-    /// empty args[0] → OOB).
-    /// OBSERVED: res.is_err() — the thunk panics because positional args is empty and args[0] OOB.
-    /// DESIRED CONTRACT: res.is_ok() + inner Err(BadArg) — kwargs silently dropped AND empty-args
-    /// index must not panic.
-    /// FINDING: macros/src/lib.rs thunk ignores _kwargs (line 68) + args[0] OOB on empty args.
-    /// seam: macros/src/lib.rs thunk ignores _kwargs + args[0] indexing on empty args
+    /// `HOLDS` (was CANARY → FINDING; arity gap FIXED 2026-06-26) — kwargs-only call.
+    /// The thunk still ignores `_kwargs`, but the arity guard now fires on the EMPTY positional
+    /// args (0 != 2) → BadArg, instead of panicking on args[0] OOB. Pre-existing behavior: a
+    /// kwargs-only call surfaces as a contained arity error (kwargs are not yet routed to params).
+    /// seam: macros/src/lib.rs thunk arity guard on empty positional args (kwargs ignored)
     #[test]
-    #[allow(non_snake_case)]
-    fn CANARY_query_kwargs_only_panics_at_thunk_level() {
-        // DESIRED (when fixed): res.is_ok() && res.unwrap() is Err(BadArg) — kwargs surfaced as error
+    fn query_kwargs_only_is_contained_bad_arg() {
         let res = catch_dispatch_kw(
             "query",
             &[],
@@ -432,28 +423,21 @@ mod tests {
                 MontyObject::String("SELECT 1".into()),
             )],
         );
+        let inner = res.expect("arity guard must return, not panic, on a kwargs-only call");
         assert!(
-            res.is_err(),
-            "CANARY: kwargs-only call must panic (thunk ignores kwargs, args[0] OOB on empty args); \
-             if this flips the finding is fixed — update to PROBE/HOLDS"
+            matches!(inner, Err(DropletError::BadArg(_))),
+            "kwargs-only call must be a contained BadArg (kwargs ignored, 0 positional args), got {inner:?}"
         );
     }
 
-    /// `CANARY` (was PROBE) — FINDING: extra (over-arity) args to `query` are silently dropped;
-    /// the 3-arg call succeeds without any arity error.
-    /// OBSERVED: res.is_ok() + inner Ok(_) — the thunk indexes only args[0]/args[1] and ignores
-    /// args[2], so the call SUCCEEDS (not even a BadArg is returned).
-    /// DESIRED CONTRACT: res.is_ok() + inner Err(BadArg) — a 3-arg call to a 2-arg tool must be
-    /// a contained arity error, not silent truncation.
-    /// FINDING: macros/src/lib.rs thunk indexes only args[0..N]; extra args silently dropped (no
-    /// len check). The successful call is also an exfiltration angle (extra arg may carry smuggled
-    /// data the tool ignores — addressed in context of the accepted V1a gap).
-    /// seam: macros/src/lib.rs thunk indexes only args[0..N]; no len check
+    /// `HOLDS` (was CANARY → FINDING; arity gap FIXED 2026-06-26) — over-arity at the thunk level.
+    /// A 3-arg call to 2-arg `query` is now a contained BadArg (`args.len() != N`), not a silent
+    /// truncation. Closes the exfiltration angle where an ignored extra arg could smuggle data — the
+    /// extra arg is now rejected instead of dropped. The engine is never reached.
+    /// seam: macros/src/lib.rs thunk arity guard rejects extra args (no silent drop)
     #[test]
-    #[allow(non_snake_case)]
-    fn CANARY_query_too_many_args_extra_arg_silently_dropped() {
+    fn query_too_many_args_is_contained_bad_arg() {
         let path = format!("{}/tests/data/sample.parquet", env!("CARGO_MANIFEST_DIR"));
-        // DESIRED (when fixed): inner Err(BadArg) — over-arity must be a contained error
         let res = catch_dispatch(
             "query",
             &[
@@ -462,57 +446,43 @@ mod tests {
                 MontyObject::String("EXTRA".into()),
             ],
         );
+        let inner = res.expect("over-arity must not panic");
         assert!(
-            res.is_ok(),
-            "over-arity must not panic (thunk ignores the extra arg)"
-        );
-        let inner = res.unwrap();
-        assert!(
-            inner.is_ok(),
-            "CANARY: a 3-arg call to 2-arg `query` currently SUCCEEDS (extra arg silently dropped); \
-             DESIRED: inner Err(BadArg) arity error. Flips when macro gains a len check."
+            matches!(inner, Err(DropletError::BadArg(_))),
+            "a 3-arg call to 2-arg `query` must be a contained BadArg, not a silent arg drop, got {inner:?}"
         );
     }
 
-    /// `HOLDS` — (Originally PROBE → CANARY; observed no panic; re-upgraded to HOLDS.)
-    /// group_agg with 2 args (missing metrics): the thunk evaluates args[0] (Dataset handle) FIRST;
-    /// an unissued handle returns BadHandle(0) via `?` BEFORE the thunk ever reaches args[2].
-    /// The early-error short-circuit makes this a CONTAINED error, not a host panic — the arity
-    /// bug is masked by the earlier handle miss. The systemic arity-panic finding is still real
-    /// (demonstrated by to_rows_zero_args and query_missing_arg where no early-exit exists),
-    /// but this specific invocation happens to be safe because the first arg fails first.
-    /// OBSERVED: res.is_ok() + inner Err(BadHandle(0)) — no panic.
-    /// seam: convert.rs Dataset::from_arg (args[0]) fails before args[2] is reached in thunk
+    /// `HOLDS` — group_agg with 2 args (missing metrics) is now rejected by the arity guard BEFORE
+    /// any arg is resolved. Pre-fix this returned BadHandle(0) — args[0] (an unissued handle) failed
+    /// before args[2] was reached, masking the arity bug. Post-fix the arity check runs first, so the
+    /// contract is the cleaner BadArg (arity), not BadHandle. Either way it is a contained error, not
+    /// a host panic — but the guard now reports the ACTUAL problem (wrong arity) instead of an
+    /// incidental handle miss.
+    /// seam: macros/src/lib.rs thunk arity guard pre-empts convert.rs Dataset::from_arg(args[0])
     #[test]
-    #[allow(non_snake_case)]
-    fn group_agg_missing_metrics_short_circuits_at_bad_handle() {
+    fn group_agg_missing_metrics_is_contained_arity_bad_arg() {
         let by = MontyObject::List(vec![MontyObject::String("region".into())]);
         let res = catch_dispatch("group_agg", &[MontyObject::Int(0), by]);
+        let inner = res.expect("arity guard must return, not panic, on a 2-arg group_agg");
         assert!(
-            res.is_ok(),
-            "must not panic — BadHandle(0) short-circuits before args[2] OOB"
-        );
-        let inner = res.unwrap();
-        assert!(
-            matches!(inner, Err(DropletError::BadHandle(0))),
-            "must return BadHandle(0) from args[0] resolution, got {inner:?}"
+            matches!(inner, Err(DropletError::BadArg(_))),
+            "a 2-arg call to 3-arg group_agg must be a contained arity BadArg, got {inner:?}"
         );
     }
 
-    /// `CANARY` (was PROBE) — FINDING: minimal arity panic: zero args to a 1-arg tool (to_rows).
-    /// Smallest reproduction — isolates the args[0] OOB crash from any handle/registry logic.
-    /// OBSERVED: res.is_err() — the thunk panics on args[0] OOB on an EMPTY args slice.
-    /// DESIRED CONTRACT: res.is_ok() + inner Err(BadArg).
-    /// seam: macros/src/lib.rs thunk args[0] on an EMPTY args slice (1-param tool)
+    /// `HOLDS` (was CANARY → FINDING; arity gap FIXED 2026-06-26) — minimal arity case: zero args to
+    /// a 1-arg tool (to_rows). Smallest reproduction — isolates the empty-slice case from any
+    /// handle/registry logic. The arity guard returns BadArg instead of indexing args[0] on an empty
+    /// slice.
+    /// seam: macros/src/lib.rs thunk arity guard on an EMPTY args slice (1-param tool)
     #[test]
-    #[allow(non_snake_case)]
-    fn CANARY_to_rows_zero_args_panics_at_thunk_level() {
-        // DESIRED (when macro gains an arity guard): res.is_ok() && inner is Err(BadArg)
+    fn to_rows_zero_args_is_contained_bad_arg() {
         let res = catch_dispatch("to_rows", &[]);
+        let inner = res.expect("arity guard must return, not panic, on an empty args slice");
         assert!(
-            res.is_err(),
-            "CANARY: to_rows() with no args must panic (args[0] OOB on empty args); \
-             if this flips the finding is fixed — update to PROBE/HOLDS"
+            matches!(inner, Err(DropletError::BadArg(_))),
+            "to_rows() with no args must be a contained BadArg, got {inner:?}"
         );
     }
 

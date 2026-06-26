@@ -1,8 +1,8 @@
 # Adversarial security suite — findings ledger (2026-06-25 / 2026-06-26)
 
-Produced by executing `docs/superpowers/plans/2026-06-25-adversarial-test-suite.md`: **195 distinct-angle
+Produced by executing `docs/superpowers/plans/2026-06-25-adversarial-test-suite.md`: **196 distinct-angle
 adversarial tests** (173 Rust `#[test]` fns across 11 class modules in `crates/droplet-core/src/security/`,
-22 Python in `crates/droplet-py/python/tests/test_security.py`) against the V1 code-mode agent surface —
+23 Python in `crates/droplet-py/python/tests/test_security.py`) against the V1 code-mode agent surface —
 well past the plan's ≥100-Rust / ≥15-Python goal. Every test
 carries a contract label — **HOLDS** (a protection that works), **PROBE** (a contract we require;
 a failure is a finding), **CANARY** (pins an accepted/observed gap; flips when closed), **LIMIT**
@@ -14,8 +14,8 @@ fails loudly the day it is fixed.
 
 | ID | Finding | Severity | Agent-triggerable? | Status | Pinned by |
 |----|---------|----------|--------------------|--------|-----------|
-| F-1 | Macro-arity panic → host process crash | **HIGH** | **Yes** (`query('x')`) | Pinned; fix chipped | `error_safety.rs`, `handles_args.rs` |
-| F-2 | Multi-statement injection → arbitrary local **write** + handle poisoning | **HIGH** | **Yes** | **FIXED 2026-06-26** (single-statement guard) | `writes_ddl.rs`, `sql_injection.rs` |
+| F-1 | Macro-arity panic → host process crash | **HIGH** | **Yes** (`query('x')`) | **FIXED 2026-06-26** (arity guard in macro thunk; canaries flipped) | `error_safety.rs`, `handles_args.rs`, `test_security.py` |
+| F-2 | Multi-statement injection → arbitrary local **write** + handle poisoning | **HIGH** | **Yes** | Pinned; fix chipped | `writes_ddl.rs`, `sql_injection.rs` |
 | F-3 | `run_id` path traversal → arbitrary dir delete/create | MEDIUM | No (host/SDK-set; **latent**) | **FIXED** (sanitize + unique dir); contracts pinned | `isolation.rs` |
 | F-4 | Cross-engine handle confusion → silent wrong-data read | MEDIUM | No (host-API misuse; **latent**) | Pinned | `test_security.py` |
 | F-5 | Result cap is row-count only (blind to width / cell bytes / `run_code` return) | LOW | Yes (volume/DoS) | Pinned | `result_cap.rs` |
@@ -27,9 +27,15 @@ attack reached through `run_code` — no panic/UAF/segfault (§ "Memory-safety r
 
 ---
 
-## F-1 — Macro-arity panic crashes the host (HIGH, agent-triggerable)
+## F-1 — Macro-arity panic crashes the host (HIGH, agent-triggerable) — ✅ FIXED 2026-06-26
 
-**Mechanism.** The `#[droplet_tool]` proc-macro thunk (`crates/droplet-macros/src/lib.rs:70`) reads each
+> **Resolved.** The `#[droplet_tool]` macro thunk now validates positional arity (`if args.len() != N
+> { return Err(BadArg(..)) }`) **before** any `&args[i]`, so a wrong-arity call (under *or* over) from
+> agent code is a contained, retryable `BadArg` — not a host panic. Verified end-to-end through
+> `run_code` and across the PyO3 boundary (catchable `RuntimeError`, no `PanicException`/abort). The
+> mechanism below is retained as the historical record; the canaries that pinned it are now `HOLDS`.
+
+**Mechanism.** The `#[droplet_tool]` proc-macro thunk (`crates/droplet-macros/src/lib.rs`) reads each
 parameter with `<T as FromArg>::from_arg(cx, &args[#indices])?`. The `&args[i]` index happens **before**
 the `?`, with **no bounds check**. Monty does **not** pre-validate tool-call arity (empirically
 confirmed); it forwards the short positional-arg list unchanged. So an **under-arity** tool call panics
@@ -51,13 +57,18 @@ panic into a **`PanicException`** (a `BaseException` subclass) — **uncatchable
 (Monty rejects extra args before dispatch); a kwargs-only call also panics (the thunk ignores kwargs and
 indexes `args[0]` on an empty slice).
 
-**Pinned by.** `security/error_safety.rs::known_gap_wrong_arity_through_run_code_panics_host` (end-to-end
-through `run_code`), `known_gap_under_arity_panics_host_via_oob_indexing`; `security/handles_args.rs`
-unit-level thunk-panic canaries.
+**Now pinned by (flipped to HOLDS).** `security/error_safety.rs::wrong_arity_through_run_code_is_contained_bad_arg`
+(end-to-end through `run_code`) and `under_arity_through_run_code_is_contained_bad_arg`; the unit-level
+`security/handles_args.rs::{query_missing_arg,query_kwargs_only,query_too_many_args,to_rows_zero_args,
+group_agg_missing_metrics}_is_contained_*`; and the PyO3-boundary
+`test_security.py::test_wrong_arity_tool_call_is_catchable_runtimeerror_not_host_crash`.
 
-**Fix (chipped).** Arity-check in the macro thunk before `&args[i]` (return a contained
-`DropletError::BadArg` on mismatch) and/or wrap the dispatch site in `catch_unwind`. Handle kwargs. When
-fixed, flip the canaries to assert a contained `BadArg`.
+**Fix landed.** Arity guard in the macro thunk before `&args[i]` returns a contained `DropletError::BadArg`
+on mismatch (`crates/droplet-macros/src/lib.rs`). The guard checks **positional** count; a kwargs-only call
+(empty positional args) now folds to `BadArg` too — the thunk still ignores `_kwargs` (routing kwargs to
+params is a separate, non-security item). `catch_unwind` at the dispatch site was deemed unnecessary: the
+root-cause guard removes the panic at its source for every tool at once. Over-arity is now rejected (was a
+silent arg-drop at the unit level), closing the extra-arg smuggling angle.
 
 ---
 
@@ -204,13 +215,13 @@ a much lower budget or an explicit absolute large-result/pow-bit ceiling. Docume
 
 | Finding | Fix chip | Where the fix lives |
 |---------|----------|---------------------|
-| F-1 macro-arity host crash | `task_43acec1a` | `crates/droplet-macros/src/lib.rs` (+ optional `catch_unwind` in `session.rs`) |
-| F-2 multi-statement write/poison | `task_e116a8f0` — **landed 2026-06-26** | `crates/droplet-core/src/engine_duckdb.rs::new_view` (`is_single_statement` guard) |
+| F-1 macro-arity host crash | `task_43acec1a` — **✅ FIXED 2026-06-26** | `crates/droplet-macros/src/lib.rs` (arity guard in the thunk; `catch_unwind` deemed unnecessary) |
+| F-2 multi-statement write/poison | `task_e116a8f0` | `crates/droplet-core/src/engine_duckdb.rs::new_view` |
 | F-3 run_id traversal | `task_3b890d35` (**fixed 2026-06-26**) | `crates/droplet-core/src/session.rs::sanitize_run_id` + `Session::new` |
 | F-4 cross-engine handle confusion | (un-chipped) | `crates/droplet-py/src/lib.rs` pyclass `Dataset` |
 | F-5 cap blind to volume | (un-chipped; V-phase) | `engine_duckdb.rs` read-out / `run_code` return |
 
-The findings were **test-only** when this suite was written (no production code changed except the
-deliberate Task-2 `LimitedTracker` wiring): each is pinned by a CANARY that flips when the fix lands.
-**F-2's fix has since landed** (2026-06-26) — the single-statement guard in `new_view` — and its canaries
-were flipped to assert the smuggle is now rejected.
+Findings were **test-only** when this ledger was first written (no production code changed except the
+deliberate Task-2 `LimitedTracker` wiring): each was pinned by a CANARY that flips when the fix lands.
+**Update 2026-06-26:** F-1 is now fixed in production code (`droplet-macros` arity guard) and its canaries
+have flipped to HOLDS; the remaining findings stay CANARY-pinned.
