@@ -19,7 +19,7 @@ fails loudly the day it is fixed.
 | F-3 | `run_id` path traversal → arbitrary dir delete/create | MEDIUM | No (host/SDK-set; **latent**) | **FIXED** (sanitize + unique dir); contracts pinned | `isolation.rs` |
 | F-4 | Cross-engine handle confusion → silent wrong-data read | MEDIUM | No (host-API misuse; **latent**) | Pinned | `test_security.py` |
 | F-5 | Result cap is row-count only (blind to width / cell bytes / `run_code` return) | LOW | Yes (volume/DoS) | Pinned | `result_cap.rs` |
-| — | Pre-existing accepted V1a local-file **read** gap (now read **and** write via F-2) | HIGH | Yes | Accepted → V3 | `exfiltration.rs`, `sql_injection.rs` |
+| — | Pre-existing accepted V1a local-file **read** gap (read-only again; F-2 write vector FIXED 2026-06-26) | HIGH | Yes | Accepted → V3 | `exfiltration.rs`, `sql_injection.rs` |
 
 **Positive results** (no finding): Monty `v0.0.18` contained **every** abstract multi-hop "Hack-Monty"
 attack reached through `run_code` — no panic/UAF/segfault (§ "Memory-safety result"). The Task-2
@@ -72,14 +72,19 @@ silent arg-drop at the unit level), closing the extra-arg smuggling angle.
 
 ---
 
-## F-2 — Multi-statement injection: arbitrary local write + handle poisoning (HIGH, agent-triggerable, local-only)
+## F-2 — Multi-statement injection: arbitrary local write + handle poisoning (HIGH, agent-triggerable, local-only) — **FIXED 2026-06-26**
 
-**Mechanism.** `crates/droplet-core/src/engine_duckdb.rs::new_view` runs agent SQL via
+**Mechanism.** `crates/droplet-core/src/engine_duckdb.rs::new_view` ran agent SQL via
 `conn.execute_batch(&format!("CREATE VIEW {table} AS {select_sql}"))`. `execute_batch` executes **every
 `;`-delimited statement**. The `query`/`local_sql` tools' `CREATE VIEW … AS (<sql>)` wrapper only
-shape-guards the **first** statement; a `;`-smuggled second statement runs unrestricted. (The old
+shape-guards the **first** statement; a `;`-smuggled second statement ran unrestricted. (The old
 `security_tests.rs` test passed only because `SELECT 1; DROP VIEW data`'s second statement errored on
-*semantics*, masking the structural gap.)
+*semantics*, masking the structural gap.) **Note — the duckdb driver does not help here:** swapping
+`execute_batch` for `prepare`/`execute` does **not** reject multi-statement input. In this pinned
+version (`duckdb 1.10503.1`), `Connection::prepare` calls `duckdb_extract_statements` and then
+**auto-executes every statement but the last** before preparing the last — so `execute` runs all the
+smuggled statements too. The `MultipleStatement` error variant exists but is never returned. The fix
+therefore had to be an explicit single-statement check, not a swap to a different driver call.
 
 **Verified consequences (empirically reproduced, opus-verified):**
 - **Arbitrary local-file WRITE:** `query(parquet, "SELECT * FROM data; COPY (SELECT 'PWNED' AS marker) TO '<path>' (FORMAT CSV)")`
@@ -97,16 +102,25 @@ shape-guards the **first** statement; a `;`-smuggled second statement runs unres
 enable_external_access` / `SET disabled_filesystems` remain blocked by the runtime latch. So: read/write
 local, then return — not POST-to-attacker.
 
-**Doc impact.** Corrected `docs/security/2026-06-24-v1a-local-fs-read-gap.md` §5 (the "File write/COPY TO"
-and "ATTACH/INSTALL" rows were FALSE for the `;`-smuggled form).
+**Doc impact.** `docs/security/2026-06-24-v1a-local-fs-read-gap.md` §5 was first corrected to record the
+gap, then updated again when the fix landed (the "File write/COPY TO", "ATTACH/INSTALL", and
+"handle-integrity" rows now read **Blocked** by the single-statement guard).
 
-**Pinned by.** `security/writes_ddl.rs::known_gap_multistatement_copy_to_writes_arbitrary_local_file`,
-`known_gap_create_or_replace_view_semicolon_poisons_existing_handle`, and the other `known_gap_multistatement_*`;
-`security/sql_injection.rs` multi-statement canaries.
+**Pinned by (flipped on fix).** `security/writes_ddl.rs::multistatement_copy_to_arbitrary_local_file_is_blocked`,
+`create_or_replace_view_semicolon_cannot_poison_handle`, `multistatement_create_table_is_rejected`,
+`multistatement_attach_database_is_rejected`, `multistatement_install_extension_is_rejected`,
+`comment_then_semicolon_second_statement_is_rejected`; `security/sql_injection.rs::multistmt_injection_via_filter_is_rejected`,
+`multistmt_query_copy_write_is_blocked`. All were `known_gap_*` CANARYs asserting the smuggle *worked*;
+they are now flipped to assert it is rejected. The single-statement scanner itself is unit-tested by
+`engine_duckdb.rs::is_single_statement_accepts_one_rejects_smuggled_second`.
 
-**Fix (chipped).** Enforce single-statement execution in `new_view` (reject embedded extra statements /
-use a single-statement API instead of `execute_batch`). The V3 DuckDB hardening (`allowed_directories` +
-`enable_external_access=false` + `lock_configuration`) should also close the write vector.
+**Fix (landed 2026-06-26).** `new_view` now runs a single-statement guard (`is_single_statement`) over
+the composed `CREATE VIEW … AS <sql>` and returns `DropletError::BadArg` for any input holding more than
+one statement (a lone trailing `;` is allowed). The scanner is fail-closed: it only skips `;` inside
+`'…'`/`"…"`/`--`/`/* */`, where DuckDB closes no earlier than it does, so it can over-reject an exotic
+literal but never lets a real second statement through. The V3 DuckDB hardening (`allowed_directories` +
+`enable_external_access=false` + `lock_configuration`) remains the defense-in-depth backstop for the
+local-FS read gap.
 
 ---
 

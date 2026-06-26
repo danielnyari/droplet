@@ -84,33 +84,40 @@ slice (it's listed under "deliberately does NOT do" in the V1a plan).
 
 Verified by the adversarial suite (`crates/droplet-core/src/security/`).
 
-> **CORRECTION (2026-06-26):** two rows of the original table below were **wrong**. The adversarial
-> suite (Task 5, `security/writes_ddl.rs`; opus-verified) found that `engine_duckdb.rs::new_view`
-> runs agent SQL via `conn.execute_batch(...)`, which executes **every `;`-delimited statement**. The
-> `CREATE VIEW … AS (<sql>)` wrapper only shape-guards the *first* statement, so a `;`-smuggled second
-> statement is **not** parser-rejected — it executes. This adds **arbitrary local-file WRITE**
-> (`…; COPY (…) TO '<path>'`) and **silent dataset-handle poisoning** (`…; CREATE OR REPLACE VIEW
-> ds_0 …`) to the blast radius, plus smuggled `CREATE TABLE`/`INSTALL`/`LOAD`/`ATTACH`. It stays
-> **local-only** — network egress is still blocked by `disabled_filesystems` (egress suite passes).
-> Full writeup + the agent-triggerable macro-arity host-crash and the latent run_id-traversal finding:
+> **FIXED (2026-06-26):** the `;`-smuggle below is now closed. Originally `engine_duckdb.rs::new_view`
+> ran agent SQL via `conn.execute_batch(...)`, which executes **every `;`-delimited statement** — and
+> the duckdb driver's `prepare`/`execute` are no safer (they call `duckdb_extract_statements` and run
+> all statements too, rather than rejecting multi-statement input). The `CREATE VIEW … AS <sql>`
+> wrapper only shape-guards the *first* statement, so a `;`-smuggled second statement **executed**:
+> **arbitrary local-file WRITE** (`…; COPY (…) TO '<path>'`), **silent dataset-handle poisoning**
+> (`…; CREATE OR REPLACE VIEW ds_0 …`), plus smuggled `CREATE TABLE`/`INSTALL`/`LOAD`/`ATTACH`.
+> `new_view` now runs a **single-statement guard** (`is_single_statement`) over the composed SQL and
+> returns an error for any input holding more than one statement (a lone trailing `;` is still
+> allowed), so every `;`-smuggled second statement is rejected **before** it reaches the engine. The
+> canaries in `security/writes_ddl.rs` and `security/sql_injection.rs` were flipped to assert the
+> smuggle is now blocked. This is **independent** of the still-open **local file READ** gap (vector
+> (a), which needs no `;` and is closed at V3 — the rest of this document). Full writeup + the
+> agent-triggerable macro-arity host-crash and the latent run_id-traversal finding:
 > [`docs/security/2026-06-25-adversarial-suite-findings.md`](2026-06-25-adversarial-suite-findings.md).
 
 | Vector | Status |
 |---|---|
 | Python OS escape (`import os`/`socket`/`subprocess`, `open`, `eval`, `exec`, `__import__`, env) | **Blocked** (Monty sandbox) |
-| Network egress (`s3://`/`https://` paths, `read_csv`/`read_parquet` over remote) | **Blocked** (no httpfs autoload + filesystems disabled; holds even for `;`-smuggled `COPY … TO 's3://…'`) |
+| Network egress (`s3://`/`https://` paths, `read_csv`/`read_parquet` over remote) | **Blocked** (no httpfs autoload + filesystems disabled; the `;`-smuggled `COPY … TO 's3://…'` form is now also rejected by the single-statement guard) |
 | File **write** / `COPY … TO` — *bare / single-statement* | **Blocked** (not a `SELECT`; parser-rejected) |
-| File **write** / `COPY … TO '<local path>'` — *`;`-smuggled 2nd statement* | **NOT blocked — `execute_batch` runs it → arbitrary local write (2026-06-26 finding)** |
+| File **write** / `COPY … TO '<local path>'` — *`;`-smuggled 2nd statement* | **Blocked** (single-statement guard in `new_view` rejects the 2nd statement; FIXED 2026-06-26) |
 | Extension load / `ATTACH` / `PRAGMA` / `SET` — *bare* | **Blocked** (not a `SELECT`) |
-| Extension load / `ATTACH` / `CREATE TABLE` — *`;`-smuggled 2nd statement* | **NOT blocked — executes locally (2026-06-26 finding); `SET enable_external_access`/`disabled_filesystems` still blocked by the runtime latch** |
-| Dataset-handle integrity (`…; CREATE OR REPLACE VIEW ds_0`) | **NOT blocked — silent wrong-data poisoning (2026-06-26 finding)** |
+| Extension load / `ATTACH` / `CREATE TABLE` — *`;`-smuggled 2nd statement* | **Blocked** (single-statement guard rejects the 2nd statement; FIXED 2026-06-26) |
+| Dataset-handle integrity (`…; CREATE OR REPLACE VIEW ds_0`) | **Blocked** (single-statement guard rejects the smuggled `CREATE OR REPLACE VIEW`; FIXED 2026-06-26) |
 | Unbounded result exfiltration in one call | **Bounded** by the row cap (invariant #6) — but the cap is row-count only (blind to row width, cell byte-size, and the `run_code` return value; 2026-06-26 finding) |
 | Calling an unregistered host function | **Errors**, session survives |
 | **Local file read / dir enumeration** | **NOT blocked — this gap** |
 
-The agent can now *read AND write* host files locally (read via `read_csv`/`read_blob`/`glob`, write
-via `;`-smuggled `COPY … TO`), but still cannot *send* them anywhere directly — network egress stays
-blocked. Blast radius: "read/write local, then return," not "read, then POST to attacker."
+With the single-statement guard in place, the agent can still *read* arbitrary host files locally
+(via `read_csv`/`read_blob`/`glob` — the open gap this document tracks), but can no longer *write*
+them: the `;`-smuggled `COPY … TO` path is rejected, and no other write vector survives. It also
+cannot *send* anything anywhere — network egress stays blocked. Blast radius is back to
+"read local, then return," not "read/write local," and never "read, then POST to attacker."
 
 ## 6. Detection
 

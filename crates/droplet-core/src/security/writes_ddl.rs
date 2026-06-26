@@ -13,30 +13,32 @@ use monty::MontyObject;
 mod tests {
     use super::*;
 
-    /// `CANARY` — FINDING: ';'-smuggled CREATE TABLE via local_sql executes and persists in the session engine (engine-state/namespace mutation). Original PROBE intent: this should be rejected. Converted from PROBE to CANARY asserting OBSERVED behavior.
-    /// // FINDING: r.is_ok() (returns Int handle) and a follow-up SELECT * FROM evil succeeds (evil persists). The execute_batch seam in new_view runs ALL statements, not just the first. Fix target: engine_duckdb.rs new_view — enforce single-statement.
-    /// seam: tools.rs local_sql tool -> engine_duckdb.rs local_sql -> new_view execute_batch; the 2nd statement CREATE TABLE persists in the session engine. local_sql with empty datasets splices sql verbatim into CREATE VIEW ds_n AS <sql>.
+    /// `HOLDS` — FIXED 2026-06-26: ';'-smuggled CREATE TABLE via local_sql is now rejected. new_view
+    /// runs a fail-closed single-statement guard (`is_single_statement`) over the composed SQL and
+    /// returns `DropletError::BadArg` for >1 statement, so the 2nd statement never reaches the engine —
+    /// `evil` is not created. (The duckdb driver can't be trusted to reject multi-statement input: its
+    /// `prepare` auto-runs all-but-the-last statement; see engine_duckdb.rs::new_view.)
+    /// seam: tools.rs local_sql tool -> engine_duckdb.rs local_sql -> new_view single-statement guard; the smuggled 2nd statement (CREATE TABLE) is rejected before execution. local_sql with empty datasets splices sql verbatim into CREATE VIEW ds_n AS <sql>.
     #[test]
-    fn known_gap_multistatement_create_table_executes_write() {
+    fn multistatement_create_table_is_rejected() {
         let mut s = Session::new("wddl-ctas").unwrap();
         let r = s.run_code("local_sql('SELECT 1 AS x; CREATE TABLE evil AS SELECT 1', [])");
         let evil_exists = s.run_code("local_sql('SELECT * FROM evil', [])").is_ok();
-        // FINDING: ';' breakout IS real — CREATE TABLE executes and persists. Assert observed (bad) behavior so a regression is caught when this is fixed.
         assert!(
-            r.is_ok(),
-            "CANARY: currently r.is_ok() (smuggled CREATE TABLE executes) — flip to is_err() when fixed"
+            r.is_err(),
+            "smuggled CREATE TABLE must be rejected (single-statement guard)"
         );
         assert!(
-            evil_exists,
-            "CANARY: evil table currently persists in session engine — assert false when fixed"
+            !evil_exists,
+            "the evil table must NOT exist — the 2nd statement never ran"
         );
     }
 
-    /// `CANARY` — FINDING: ';'-smuggled ATTACH via query() executes and widens the connection's reachable catalog. Original PROBE intent: this should be rejected. Converted from PROBE to CANARY asserting OBSERVED behavior.
-    /// // FINDING: ATTACH ':memory:' AS evildb succeeds (Ok). ATTACH of a real .db file path is also a route to read/write arbitrary DB files. Fix target: engine_duckdb.rs new_view — enforce single-statement.
-    /// seam: engine_duckdb.rs new_view execute_batch; 2nd statement ATTACH adds a database to the connection catalog.
+    /// `HOLDS` — FIXED 2026-06-26: ';'-smuggled ATTACH via query() is now rejected, so it cannot widen
+    /// the connection's reachable catalog (ATTACH of a real .db path was a route to read/write DB files).
+    /// seam: engine_duckdb.rs new_view single-statement guard; the 2nd statement (ATTACH) is rejected by `is_single_statement` before it can add a database to the catalog.
     #[test]
-    fn known_gap_multistatement_attach_database_succeeds() {
+    fn multistatement_attach_database_is_rejected() {
         let dir = tmp_dir("wddl-attach");
         let p = sales_parquet(&dir);
         let mut s = Session::new("wddl-attach").unwrap();
@@ -45,18 +47,18 @@ mod tests {
             "SELECT * FROM data; ATTACH ':memory:' AS evildb"
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        // FINDING: ';' breakout IS real — ATTACH executes and widens catalog. Assert observed (bad) behavior.
         assert!(
-            r.is_ok(),
-            "CANARY: currently r.is_ok() (smuggled ATTACH executes) — flip to is_err() when fixed"
+            r.is_err(),
+            "smuggled ATTACH must be rejected (single-statement guard)"
         );
     }
 
-    /// `CANARY` — FINDING: ';'-smuggled INSTALL via query() executes (statement-shape containment bypassed). Egress remains blocked by disabled_filesystems latch (separate defense). Original PROBE intent: this should be rejected. Converted from PROBE to CANARY asserting OBSERVED behavior.
-    /// // FINDING: INSTALL httpfs executes Ok (statement-shape bypass confirmed). The disabled_filesystems latch is the real backstop, not the wrapper. Fix target: engine_duckdb.rs new_view — enforce single-statement.
-    /// seam: engine_duckdb.rs new_view execute_batch; 2nd statement INSTALL bypasses the single-SELECT view-body assumption (statement-shape containment), even though egress stays blocked by a separate latch.
+    /// `HOLDS` — FIXED 2026-06-26: ';'-smuggled INSTALL via query() is now rejected (statement-shape
+    /// containment restored at the statement boundary, not just the wrapper). Egress was already blocked
+    /// by the disabled_filesystems latch (separate defense); this closes the smuggle path itself.
+    /// seam: engine_duckdb.rs new_view single-statement guard; the 2nd statement (INSTALL) is rejected by `is_single_statement` before it can run.
     #[test]
-    fn known_gap_multistatement_install_extension_runs() {
+    fn multistatement_install_extension_is_rejected() {
         let dir = tmp_dir("wddl-install");
         let p = sales_parquet(&dir);
         let mut s = Session::new("wddl-install").unwrap();
@@ -65,10 +67,9 @@ mod tests {
             "SELECT * FROM data; INSTALL httpfs"
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        // FINDING: ';' breakout IS real — INSTALL executes (statement-shape bypass). Egress still blocked by separate latch. Assert observed (bad) behavior.
         assert!(
-            r.is_ok(),
-            "CANARY: currently r.is_ok() (smuggled INSTALL executes) — flip to is_err() when fixed"
+            r.is_err(),
+            "smuggled INSTALL must be rejected (single-statement guard)"
         );
     }
 
@@ -130,11 +131,12 @@ mod tests {
         assert!(!wrote, "paren-injection COPY must not write a file"); // VERIFIED this session: 'Parser Error: syntax error at or near \")\"' on `... WITH data AS (...) SELECT * FROM data) ; COPY ...`; no file written.
     }
 
-    /// `CANARY` — FINDING: block-comment obfuscation + ';' still smuggles a 2nd statement (CREATE TABLE executes). Comments are irrelevant; the ';' is the seam. Original PROBE intent: this should be rejected. Converted from PROBE to CANARY asserting OBSERVED behavior.
-    /// // FINDING: '/* hide */ ; CREATE TABLE evil2 AS SELECT 1' executes the CREATE TABLE. Comment obfuscation provides no additional bypass mechanism — the ';' alone is the gap. Fix target: engine_duckdb.rs new_view — enforce single-statement.
-    /// seam: engine_duckdb.rs new_view execute_batch; a block comment before ';' does not change the statement boundary — the ';' still starts a real 2nd statement (CREATE TABLE).
+    /// `HOLDS` — FIXED 2026-06-26: block-comment obfuscation + ';' is rejected like any other ';'-smuggle.
+    /// The comment was never the seam — the ';' is — and the single-statement guard rejects the 2nd
+    /// statement regardless of an intervening block comment, so evil2 is never created.
+    /// seam: engine_duckdb.rs new_view single-statement guard; a block comment before ';' does not change the statement boundary — `is_single_statement` still sees two statements and rejects.
     #[test]
-    fn known_gap_comment_then_semicolon_smuggles_second_statement() {
+    fn comment_then_semicolon_second_statement_is_rejected() {
         let dir = tmp_dir("wddl-comment");
         let p = sales_parquet(&dir);
         let mut s = Session::new("wddl-comment").unwrap();
@@ -147,14 +149,13 @@ mod tests {
             "SELECT count(*) AS c FROM evil2"
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        // FINDING: comment + ';' breakout IS real — CREATE TABLE executes. Assert observed (bad) behavior.
         assert!(
-            r.is_ok(),
-            "CANARY: currently r.is_ok() (smuggled CREATE TABLE via comment+; executes) — flip to is_err() when fixed"
+            r.is_err(),
+            "smuggled CREATE TABLE behind a block comment must be rejected (single-statement guard)"
         );
         assert!(
-            leaked.is_ok(),
-            "CANARY: evil2 table currently exists and is queryable — assert is_err() when fixed"
+            leaked.is_err(),
+            "evil2 must NOT exist — querying it must error (the 2nd statement never ran)"
         );
     }
 
@@ -259,47 +260,50 @@ mod tests {
         ); // VERIFIED this session: the leading ')' is unbalanced -> 'Parser Error: syntax error at or near \")\"'.
     }
 
-    /// `CANARY` — FINDING: ';'-smuggled CREATE OR REPLACE VIEW via local_sql silently poisons an existing handle's view (handle-content integrity violation). Original PROBE intent: this should be rejected. Converted from PROBE to CANARY asserting OBSERVED behavior.
-    /// // FINDING: CREATE OR REPLACE VIEW ds_0 succeeds and mutates the view the earlier `ds` handle resolves to — to_rows(ds) subsequently returns the attacker's injected rows. This is a distinct consequence-class: not disk write/CTAS/ATTACH, but SILENT DATA INTEGRITY CORRUPTION of an opaque handle. Fix target: engine_duckdb.rs new_view — enforce single-statement.
-    /// seam: engine_duckdb.rs new_view execute_batch; a ';'-smuggled CREATE OR REPLACE VIEW ds_0 rewrites the view an EARLIER handle resolves to (handle-content poisoning / data integrity).
+    /// `HOLDS` — FIXED 2026-06-26: a ';'-smuggled CREATE OR REPLACE VIEW ds_0 can no longer silently
+    /// poison an existing handle's view (handle-content integrity). The single-statement guard in
+    /// new_view rejects the smuggled DDL, so the earlier handle still resolves to its original rows.
+    /// Verified at the DuckEngine seam, NOT Session::run_code: a hard engine error consumes the
+    /// session REPL (see session.rs `run_code`), so a post-rejection read must go straight to the
+    /// engine — using the session here would just hit "REPL consumed by a prior failed run".
+    /// seam: engine_duckdb.rs new_view single-statement guard; the ';'-smuggled CREATE OR REPLACE VIEW ds_0 is rejected before it can rewrite the earlier handle's view.
     #[test]
-    fn known_gap_create_or_replace_view_semicolon_poisons_existing_handle() {
+    fn create_or_replace_view_semicolon_cannot_poison_handle() {
         let dir = tmp_dir("wd-poison");
         let p = sales_parquet(&dir);
-        let mut s = Session::new("wd-poison").unwrap();
-        s.run_code(&format!("ds = register({p:?})")).unwrap(); // ds -> handle 0 -> view ds_0
-        let before = s.run_code("to_rows(ds)").unwrap(); // baseline (region 'EU', amt 1.0)
+        let mut eng = DuckEngine::new_in_memory().unwrap();
+        let ds = eng.register_parquet(&p).unwrap(); // -> view ds_0
+        let before = format!("{:?}", eng.to_rows_values(&ds).unwrap()); // baseline (region 'EU', amt 1.0)
         // ;-smuggle a CREATE OR REPLACE VIEW ds_0 (deterministic engine view name) with attacker rows:
-        let evil = "local_sql('SELECT 1 AS x; CREATE OR REPLACE VIEW ds_0 AS SELECT 99 AS region, CAST(1234.0 AS DOUBLE) AS amt', [])";
-        let r = s.run_code(evil);
-        // FINDING: ';' breakout IS real — handle-content poisoning confirmed. Assert observed (bad) behavior.
-        assert!(
-            r.is_ok(),
-            "CANARY: currently r.is_ok() (smuggled CREATE OR REPLACE VIEW executes, poisoning handle) — flip to is_err() when fixed; got {r:?}"
-        );
-        let after = s.run_code("to_rows(ds)").unwrap(); // SAME handle, now poisoned
-        let before_s = format!("{before:?}");
-        let after_s = format!("{after:?}");
-        assert_ne!(
-            before_s, after_s,
-            "KNOWN GAP: the handle's data changed silently"
+        let r = eng.local_sql(
+            "SELECT 1 AS x; CREATE OR REPLACE VIEW ds_0 AS SELECT 99 AS region, CAST(1234.0 AS DOUBLE) AS amt",
+            &[],
         );
         assert!(
-            after_s.contains("99") && after_s.contains("1234"),
-            "KNOWN GAP: handle now returns ATTACKER rows: {after_s}"
+            r.is_err(),
+            "smuggled CREATE OR REPLACE VIEW must be rejected (single-statement guard); got {r:?}"
+        );
+        let after = format!("{:?}", eng.to_rows_values(&ds).unwrap()); // SAME handle, must be untouched
+        assert_eq!(
+            before, after,
+            "the handle's data must be unchanged — the smuggled CREATE OR REPLACE VIEW never ran"
+        );
+        assert!(
+            !after.contains("99") && !after.contains("1234"),
+            "the handle must NOT return attacker rows: {after}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `CANARY` — FINDING (HIGH, new): the query() CREATE VIEW wrapper does NOT block a ;-smuggled COPY TO,
-    /// so an agent can WRITE attacker content to an arbitrary host path (engine_duckdb.rs::new_view uses
-    /// execute_batch, running every ;-delimited statement). Local-only (no network egress). Flip to assert
-    /// the write is BLOCKED when new_view enforces single-statement execution.
+    /// `HOLDS` — FIXED 2026-06-26 (was HIGH): the ';'-smuggled COPY TO arbitrary-local-write is now
+    /// blocked. new_view runs a fail-closed single-statement guard (`is_single_statement`) over the
+    /// composed SQL, so the smuggled second statement (`…; COPY (…) TO '<path>'`) is rejected (returns
+    /// `DropletError::BadArg`) and no host file is written. The COPY never reaches the engine.
     #[test]
-    fn known_gap_multistatement_copy_to_writes_arbitrary_local_file() {
+    fn multistatement_copy_to_arbitrary_local_file_is_blocked() {
         let dir = tmp_dir("wd-copywrite");
         let p = sales_parquet(&dir);
-        // Target OUTSIDE the session work_dir, proving arbitrary-path write:
+        // Target OUTSIDE the session work_dir, proving an arbitrary-path write would be the impact:
         let target = dir.join("exfil_PWNED.csv");
         let target_s = target.to_str().unwrap().to_string();
         let _ = std::fs::remove_file(&target);
@@ -309,17 +313,12 @@ mod tests {
         );
         let r = s.run_code(&code);
         assert!(
-            r.is_ok(),
-            "KNOWN GAP: ;-smuggled COPY TO executes via execute_batch; got {r:?}"
+            r.is_err(),
+            "smuggled COPY TO must be rejected (single-statement guard); got {r:?}"
         );
         assert!(
-            target.exists(),
-            "KNOWN GAP: arbitrary local-file WRITE — the COPY created a host file"
-        );
-        let contents = std::fs::read_to_string(&target).unwrap_or_default();
-        assert!(
-            contents.contains("PWNED"),
-            "the written file holds attacker content: {contents:?}"
+            !target.exists(),
+            "no host file may be written — the smuggled COPY never ran"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

