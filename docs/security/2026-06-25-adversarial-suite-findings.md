@@ -16,7 +16,7 @@ fails loudly the day it is fixed.
 |----|---------|----------|--------------------|--------|-----------|
 | F-1 | Macro-arity panic → host process crash | **HIGH** | **Yes** (`query('x')`) | Pinned; fix chipped | `error_safety.rs`, `handles_args.rs` |
 | F-2 | Multi-statement injection → arbitrary local **write** + handle poisoning | **HIGH** | **Yes** | Pinned; fix chipped | `writes_ddl.rs`, `sql_injection.rs` |
-| F-3 | `run_id` path traversal → arbitrary dir delete/create | MEDIUM | No (host/SDK-set; **latent**) | Pinned; fix chipped | `isolation.rs` |
+| F-3 | `run_id` path traversal → arbitrary dir delete/create | MEDIUM | No (host/SDK-set; **latent**) | **FIXED** (sanitize + unique dir); contracts pinned | `isolation.rs` |
 | F-4 | Cross-engine handle confusion → silent wrong-data read | MEDIUM | No (host-API misuse; **latent**) | Pinned | `test_security.py` |
 | F-5 | Result cap is row-count only (blind to width / cell bytes / `run_code` return) | LOW | Yes (volume/DoS) | Pinned | `result_cap.rs` |
 | — | Pre-existing accepted V1a local-file **read** gap (now read **and** write via F-2) | HIGH | Yes | Accepted → V3 | `exfiltration.rs`, `sql_injection.rs` |
@@ -99,30 +99,35 @@ use a single-statement API instead of `execute_batch`). The V3 DuckDB hardening 
 
 ---
 
-## F-3 — `run_id` path traversal (MEDIUM, latent)
+## F-3 — `run_id` path traversal (MEDIUM, latent) — **FIXED 2026-06-26**
 
-**Mechanism.** `crates/droplet-core/src/session.rs` `Session::new(run_id)` builds the work dir as
+**Mechanism (was).** `crates/droplet-core/src/session.rs` `Session::new(run_id)` built the work dir as
 `std::env::temp_dir().join(format!("droplet-{run_id}"))` with **no sanitization**, then
 `fs::remove_dir_all(&work_dir)` (destructive) followed by `fs::create_dir_all(&work_dir)`. A `run_id`
-containing `../` escapes the temp root: `Session::new("../../../../../../tmp/droplet-evil")` resolves
+containing `../` escaped the temp root: `Session::new("../../../../../../tmp/droplet-evil")` resolved
 (canonicalized) to `/var/tmp/droplet-evil` — **outside** `temp_dir()` — so **both** a `remove_dir_all`
-and a `create_dir_all` operate on an arbitrary path. An arbitrary-directory delete+create primitive.
+and a `create_dir_all` operated on an arbitrary path. An arbitrary-directory delete+create primitive.
 
 **Why latent (not agent-triggerable).** `run_id` reaches `Session::new` only from the host/SDK
 constructor (`droplet-py` `Session(run_id)`); sandboxed agent code runs **inside** an already-built
-session via `run_code` and has **no path** to `Session::new`. Exploitable only if a host ever derives
+session via `run_code` and has **no path** to `Session::new`. Exploitable only if a host ever derived
 `run_id` from untrusted input (a multi-tenant id, a request parameter, a filename). Also found:
-same-`run_id` collision wipes a prior session's work dir; a `/`-containing `run_id` leaves orphaned
+same-`run_id` collision wiped a prior session's work dir; a `/`-containing `run_id` left orphaned
 parent dirs after `Drop`.
 
-**Pinned by.** `security/isolation.rs::known_gap_run_id_dotdot_traversal_creates_dir_outside_temp_dir`,
-`known_gap_run_id_traversal_removes_dir_outside_temp_dir`,
-`known_gap_same_run_id_second_session_wipes_first_sessions_work_dir`,
-`known_gap_run_id_with_subdir_separators_leaves_parent_residue`. (Every FS-touching test was verified to
-target only unique self-created `droplet-`-prefixed paths — it cannot wipe a real directory.)
+**Fix (landed).** `session.rs::sanitize_run_id` flattens `run_id` to a SINGLE in-temp path component
+**before** the `temp_dir().join` — path separators are split on and `.`/`..`/empty segments dropped
+(`../../tmp/evil` → `tmp_evil`, `a/b/c` → `a_b_c`), so the work dir can neither escape nor nest. A
+process-unique sequence (`droplet-{safe}-{pid}-{seq}`) makes each session's dir distinct, so two
+sessions sharing a `run_id` get separate dirs (no cross-session wipe). NUL / over-long names are left
+to flow to the OS, which still rejects them as a clean `DropletError::Io` (HOLDS tests unchanged).
 
-**Fix (chipped).** Sanitize `run_id` (reject path separators + `..` + NUL, bound length, or hash it);
-make the work dir unique per session instance; assert it stays under `temp_dir()`.
+**Pinned by (now CONTRACT, not CANARY).**
+`security/isolation.rs::run_id_dotdot_traversal_stays_inside_temp_dir`,
+`run_id_traversal_does_not_remove_dir_outside_temp_dir`,
+`same_run_id_sessions_are_isolated`,
+`run_id_with_subdir_separators_stays_contained_no_residue`. (Every FS-touching test targets only
+unique self-created `droplet-`-prefixed paths — it cannot wipe a real directory.)
 
 ---
 
@@ -187,7 +192,7 @@ a much lower budget or an explicit absolute large-result/pow-bit ceiling. Docume
 |---------|----------|---------------------|
 | F-1 macro-arity host crash | `task_43acec1a` | `crates/droplet-macros/src/lib.rs` (+ optional `catch_unwind` in `session.rs`) |
 | F-2 multi-statement write/poison | `task_e116a8f0` | `crates/droplet-core/src/engine_duckdb.rs::new_view` |
-| F-3 run_id traversal | `task_3b890d35` | `crates/droplet-core/src/session.rs::Session::new` |
+| F-3 run_id traversal | `task_3b890d35` (**fixed 2026-06-26**) | `crates/droplet-core/src/session.rs::sanitize_run_id` + `Session::new` |
 | F-4 cross-engine handle confusion | (un-chipped) | `crates/droplet-py/src/lib.rs` pyclass `Dataset` |
 | F-5 cap blind to volume | (un-chipped; V-phase) | `engine_duckdb.rs` read-out / `run_code` return |
 
