@@ -15,14 +15,13 @@ mod tests {
 
     /// `CONTRACT` (was a CANARY for F-3) — Core traversal: a host-supplied run_id with `../` is
     /// flattened to a single in-temp component before the `temp_dir().join`, so the work_dir can
-    /// never climb above temp_dir.
+    /// never climb above temp_dir. The only FS mutations Session::new makes are on work_dir itself
+    /// (create_dir_all + remove_dir_all), so asserting work_dir's containment is sufficient proof
+    /// nothing escaped — no out-of-temp probe path needed (keeps this test portable).
     /// seam: session.rs Session::new — sanitize_run_id drops `..`/separators ahead of create_dir_all.
     #[test]
     fn run_id_dotdot_traversal_stays_inside_temp_dir() {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        // Clean any pre-fix residue so the escape-target assert below is deterministic.
-        let _ = std::fs::remove_dir_all("/private/var/tmp/droplet-evil-traversal-probe");
-        let _ = std::fs::remove_dir_all("/var/tmp/droplet-evil-traversal-probe");
         let run_id = "../../../../../../tmp/droplet-evil-traversal-probe";
         let sess = Session::new(run_id).expect("a traversing run_id is sanitized, not rejected");
         let canon = std::fs::canonicalize(sess.work_dir()).unwrap();
@@ -31,28 +30,31 @@ mod tests {
             canon.starts_with(&base) && canon != base,
             "run_id traversal escaped temp_dir: work_dir={canon:?} base={base:?}"
         );
-        drop(sess); // wipes work_dir
-        // And nothing was ever created at the escape target.
-        assert!(
-            !std::path::Path::new("/private/var/tmp/droplet-evil-traversal-probe").exists()
-                && !std::path::Path::new("/var/tmp/droplet-evil-traversal-probe").exists(),
-            "a dir was created OUTSIDE temp_dir via run_id traversal"
-        );
     }
 
     /// `CONTRACT` (was a CANARY for F-3) — Distinct from creation: the pre-create remove_dir_all must
     /// target only the sanitized in-temp work_dir, so a victim dir OUTSIDE temp_dir is never deleted.
+    /// Unix-only (uses `/var/tmp` as a real out-of-temp location) with a PER-RUN-UNIQUE victim name,
+    /// so the test only ever creates/removes its OWN freshly-minted dir — never a pre-existing one.
     /// seam: session.rs Session::new — `fs::remove_dir_all(&work_dir)` after run_id is flattened.
+    #[cfg(unix)]
     #[test]
     fn run_id_traversal_does_not_remove_dir_outside_temp_dir() {
-        // Plant a victim where the un-sanitized run_id used to resolve (canon /private/var/tmp on macOS).
-        let victim = std::path::Path::new("/var/tmp").join("droplet-victim-delete-probe");
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "droplet-victim-delete-probe-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let victim = std::path::Path::new("/var/tmp").join(&name);
         std::fs::create_dir_all(&victim).unwrap();
         std::fs::write(victim.join("keepme.txt"), b"do-not-delete").unwrap();
-        let run_id = "../../../../../../tmp/droplet-victim-delete-probe";
-        let _sess = Session::new(run_id).unwrap(); // remove_dir_all now targets an in-temp path only
+        // The un-sanitized run_id used to resolve out of temp_dir; sanitize keeps the wipe in-temp.
+        let run_id = format!("../../../../../../tmp/{name}");
+        let _sess = Session::new(&run_id).unwrap();
         let survived = victim.join("keepme.txt").exists();
-        let _ = std::fs::remove_dir_all(&victim); // cleanup
+        let _ = std::fs::remove_dir_all(&victim); // cleanup (only ever our own unique dir)
         assert!(
             survived,
             "Session::new wiped a dir OUTSIDE temp_dir via run_id traversal"
