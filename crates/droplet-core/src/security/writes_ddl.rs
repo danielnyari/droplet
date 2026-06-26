@@ -14,9 +14,11 @@ mod tests {
     use super::*;
 
     /// `HOLDS` — FIXED 2026-06-26: ';'-smuggled CREATE TABLE via local_sql is now rejected. new_view
-    /// runs agent SQL through single-statement `execute` (DuckDB prepare → `MultipleStatement` error)
-    /// instead of execute_batch, so the 2nd statement never reaches the engine — `evil` is not created.
-    /// seam: tools.rs local_sql tool -> engine_duckdb.rs local_sql -> new_view single-statement execute; the smuggled 2nd statement (CREATE TABLE) is rejected by prepare. local_sql with empty datasets splices sql verbatim into CREATE VIEW ds_n AS <sql>.
+    /// runs a fail-closed single-statement guard (`is_single_statement`) over the composed SQL and
+    /// returns `DropletError::BadArg` for >1 statement, so the 2nd statement never reaches the engine —
+    /// `evil` is not created. (The duckdb driver can't be trusted to reject multi-statement input: its
+    /// `prepare` auto-runs all-but-the-last statement; see engine_duckdb.rs::new_view.)
+    /// seam: tools.rs local_sql tool -> engine_duckdb.rs local_sql -> new_view single-statement guard; the smuggled 2nd statement (CREATE TABLE) is rejected before execution. local_sql with empty datasets splices sql verbatim into CREATE VIEW ds_n AS <sql>.
     #[test]
     fn multistatement_create_table_is_rejected() {
         let mut s = Session::new("wddl-ctas").unwrap();
@@ -24,7 +26,7 @@ mod tests {
         let evil_exists = s.run_code("local_sql('SELECT * FROM evil', [])").is_ok();
         assert!(
             r.is_err(),
-            "smuggled CREATE TABLE must be rejected (single-statement execute)"
+            "smuggled CREATE TABLE must be rejected (single-statement guard)"
         );
         assert!(
             !evil_exists,
@@ -34,7 +36,7 @@ mod tests {
 
     /// `HOLDS` — FIXED 2026-06-26: ';'-smuggled ATTACH via query() is now rejected, so it cannot widen
     /// the connection's reachable catalog (ATTACH of a real .db path was a route to read/write DB files).
-    /// seam: engine_duckdb.rs new_view single-statement execute; the 2nd statement (ATTACH) is rejected by prepare (MultipleStatement) before it can add a database to the catalog.
+    /// seam: engine_duckdb.rs new_view single-statement guard; the 2nd statement (ATTACH) is rejected by `is_single_statement` before it can add a database to the catalog.
     #[test]
     fn multistatement_attach_database_is_rejected() {
         let dir = tmp_dir("wddl-attach");
@@ -47,14 +49,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             r.is_err(),
-            "smuggled ATTACH must be rejected (single-statement execute)"
+            "smuggled ATTACH must be rejected (single-statement guard)"
         );
     }
 
     /// `HOLDS` — FIXED 2026-06-26: ';'-smuggled INSTALL via query() is now rejected (statement-shape
     /// containment restored at the statement boundary, not just the wrapper). Egress was already blocked
     /// by the disabled_filesystems latch (separate defense); this closes the smuggle path itself.
-    /// seam: engine_duckdb.rs new_view single-statement execute; the 2nd statement (INSTALL) is rejected by prepare (MultipleStatement) before it can run.
+    /// seam: engine_duckdb.rs new_view single-statement guard; the 2nd statement (INSTALL) is rejected by `is_single_statement` before it can run.
     #[test]
     fn multistatement_install_extension_is_rejected() {
         let dir = tmp_dir("wddl-install");
@@ -67,7 +69,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             r.is_err(),
-            "smuggled INSTALL must be rejected (single-statement execute)"
+            "smuggled INSTALL must be rejected (single-statement guard)"
         );
     }
 
@@ -130,9 +132,9 @@ mod tests {
     }
 
     /// `HOLDS` — FIXED 2026-06-26: block-comment obfuscation + ';' is rejected like any other ';'-smuggle.
-    /// The comment was never the seam — the ';' is — and single-statement execute rejects the 2nd
+    /// The comment was never the seam — the ';' is — and the single-statement guard rejects the 2nd
     /// statement regardless of an intervening block comment, so evil2 is never created.
-    /// seam: engine_duckdb.rs new_view single-statement execute; a block comment before ';' does not change the statement boundary — DuckDB prepare still sees two statements and rejects (MultipleStatement).
+    /// seam: engine_duckdb.rs new_view single-statement guard; a block comment before ';' does not change the statement boundary — `is_single_statement` still sees two statements and rejects.
     #[test]
     fn comment_then_semicolon_second_statement_is_rejected() {
         let dir = tmp_dir("wddl-comment");
@@ -149,7 +151,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             r.is_err(),
-            "smuggled CREATE TABLE behind a block comment must be rejected (single-statement execute)"
+            "smuggled CREATE TABLE behind a block comment must be rejected (single-statement guard)"
         );
         assert!(
             leaked.is_err(),
@@ -294,9 +296,9 @@ mod tests {
     }
 
     /// `HOLDS` — FIXED 2026-06-26 (was HIGH): the ';'-smuggled COPY TO arbitrary-local-write is now
-    /// blocked. new_view runs agent SQL through single-statement `execute`, so the smuggled second
-    /// statement (`…; COPY (…) TO '<path>'`) is rejected by DuckDB prepare (MultipleStatement) and no
-    /// host file is written. The COPY never reaches the engine.
+    /// blocked. new_view runs a fail-closed single-statement guard (`is_single_statement`) over the
+    /// composed SQL, so the smuggled second statement (`…; COPY (…) TO '<path>'`) is rejected (returns
+    /// `DropletError::BadArg`) and no host file is written. The COPY never reaches the engine.
     #[test]
     fn multistatement_copy_to_arbitrary_local_file_is_blocked() {
         let dir = tmp_dir("wd-copywrite");
@@ -312,7 +314,7 @@ mod tests {
         let r = s.run_code(&code);
         assert!(
             r.is_err(),
-            "smuggled COPY TO must be rejected (single-statement execute); got {r:?}"
+            "smuggled COPY TO must be rejected (single-statement guard); got {r:?}"
         );
         assert!(
             !target.exists(),

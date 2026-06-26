@@ -346,7 +346,7 @@ fn is_single_statement(sql: &str) -> bool {
             while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
                 i += 1;
             }
-            i += 2; // step past the closing */ (saturates past end if unterminated)
+            i += 2; // step past the closing */ (may overshoot b.len() if unterminated; the `i < b.len()` loop guard ends the scan)
             continue;
         }
         if c.is_ascii_whitespace() {
