@@ -15,7 +15,7 @@ fails loudly the day it is fixed.
 | ID | Finding | Severity | Agent-triggerable? | Status | Pinned by |
 |----|---------|----------|--------------------|--------|-----------|
 | F-1 | Macro-arity panic → host process crash | **HIGH** | **Yes** (`query('x')`) | **FIXED 2026-06-26** (arity guard in macro thunk; canaries flipped) | `error_safety.rs`, `handles_args.rs`, `test_security.py` |
-| F-2 | Multi-statement injection → arbitrary local **write** + handle poisoning | **HIGH** | **Yes** | Pinned; fix chipped | `writes_ddl.rs`, `sql_injection.rs` |
+| F-2 | Multi-statement injection → arbitrary local **write** + handle poisoning | **HIGH** | **Yes** | **FIXED 2026-06-26** (single-statement guard) | `writes_ddl.rs`, `sql_injection.rs` |
 | F-3 | `run_id` path traversal → arbitrary dir delete/create | MEDIUM | No (host/SDK-set; **latent**) | **FIXED** (sanitize + unique dir); contracts pinned | `isolation.rs` |
 | F-4 | Cross-engine handle confusion → silent wrong-data read | MEDIUM | No (host-API misuse; **latent**) | Pinned | `test_security.py` |
 | F-5 | Result cap is row-count only (blind to width / cell bytes / `run_code` return) | LOW | Yes (volume/DoS) | Pinned | `result_cap.rs` |
@@ -216,12 +216,14 @@ a much lower budget or an explicit absolute large-result/pow-bit ceiling. Docume
 | Finding | Fix chip | Where the fix lives |
 |---------|----------|---------------------|
 | F-1 macro-arity host crash | `task_43acec1a` — **✅ FIXED 2026-06-26** | `crates/droplet-macros/src/lib.rs` (arity guard in the thunk; `catch_unwind` deemed unnecessary) |
-| F-2 multi-statement write/poison | `task_e116a8f0` | `crates/droplet-core/src/engine_duckdb.rs::new_view` |
+| F-2 multi-statement write/poison | `task_e116a8f0` — **landed 2026-06-26** | `crates/droplet-core/src/engine_duckdb.rs::new_view` (`is_single_statement` guard) |
 | F-3 run_id traversal | `task_3b890d35` (**fixed 2026-06-26**) | `crates/droplet-core/src/session.rs::sanitize_run_id` + `Session::new` |
 | F-4 cross-engine handle confusion | (un-chipped) | `crates/droplet-py/src/lib.rs` pyclass `Dataset` |
 | F-5 cap blind to volume | (un-chipped; V-phase) | `engine_duckdb.rs` read-out / `run_code` return |
 
 Findings were **test-only** when this ledger was first written (no production code changed except the
 deliberate Task-2 `LimitedTracker` wiring): each was pinned by a CANARY that flips when the fix lands.
-**Update 2026-06-26:** F-1 is now fixed in production code (`droplet-macros` arity guard) and its canaries
-have flipped to HOLDS; the remaining findings stay CANARY-pinned.
+**Update 2026-06-26:** F-1 (`droplet-macros` arity guard), F-2 (the `is_single_statement` guard in
+`new_view`), and F-3 (`sanitize_run_id` in `Session::new`) are now fixed in production code and their
+canaries have flipped to HOLDS / portable contract tests; the remaining findings (F-4, F-5) stay
+CANARY-pinned.
