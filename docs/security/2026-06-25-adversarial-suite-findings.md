@@ -35,7 +35,7 @@ attack reached through `run_code` — no panic/UAF/segfault (§ "Memory-safety r
 > `run_code` and across the PyO3 boundary (catchable `RuntimeError`, no `PanicException`/abort). The
 > mechanism below is retained as the historical record; the canaries that pinned it are now `HOLDS`.
 
-**Mechanism.** The `#[droplet_tool]` proc-macro thunk (`crates/droplet-macros/src/lib.rs:70`) read each
+**Mechanism.** The `#[droplet_tool]` proc-macro thunk (`crates/droplet-macros/src/lib.rs`) reads each
 parameter with `<T as FromArg>::from_arg(cx, &args[#indices])?`. The `&args[i]` index happens **before**
 the `?`, with **no bounds check**. Monty does **not** pre-validate tool-call arity (empirically
 confirmed); it forwards the short positional-arg list unchanged. So an **under-arity** tool call panics
