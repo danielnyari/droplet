@@ -13,62 +13,51 @@ use monty::MontyObject;
 mod tests {
     use super::*;
 
-    /// `CANARY` — Core traversal: agent-influenced run_id with ../ climbs above temp_dir and create_dir_all lands a real dir outside the sandbox root.
-    /// FINDING: Session::new creates a work_dir OUTSIDE temp_dir via run_id traversal (confirmed on macOS).
-    /// Pinning OBSERVED behavior: Session::new returns Ok and work_dir canonicalizes to /private/var/tmp/droplet-evil-traversal-probe (outside temp_dir).
-    /// seam: session.rs Session::new — temp_dir().join(format!("droplet-{run_id}")) + create_dir_all; path traversal via run_id
+    /// `CONTRACT` (was a CANARY for F-3) — Core traversal: a host-supplied run_id with `../` is
+    /// flattened to a single in-temp component before the `temp_dir().join`, so the work_dir can
+    /// never climb above temp_dir. The only FS mutations Session::new makes are on work_dir itself
+    /// (create_dir_all + remove_dir_all), so asserting work_dir's containment is sufficient proof
+    /// nothing escaped — no out-of-temp probe path needed (keeps this test portable).
+    /// seam: session.rs Session::new — sanitize_run_id drops `..`/separators ahead of create_dir_all.
     #[test]
-    fn known_gap_run_id_dotdot_traversal_creates_dir_outside_temp_dir() {
+    fn run_id_dotdot_traversal_stays_inside_temp_dir() {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let run_id = "../../../../../../tmp/droplet-evil-traversal-probe";
-        let sess = Session::new(run_id);
-        let made = sess.as_ref().ok().map(|s| s.work_dir().to_path_buf());
-        let canon_made = made
-            .as_ref()
-            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
-        if let Some(c) = &canon_made {
-            let _ = std::fs::remove_dir_all(c);
-        }
-        // belt-and-suspenders cleanup at both possible resolutions:
-        let _ = std::fs::remove_dir_all(std::path::Path::new(
-            "/private/var/tmp/droplet-evil-traversal-probe",
-        ));
-        let _ = std::fs::remove_dir_all(std::path::Path::new(
-            "/var/tmp/droplet-evil-traversal-probe",
-        ));
-        // FINDING: CANARY pinning OBSERVED behavior — Session::new succeeds and work_dir escapes temp_dir.
-        // If this test ever starts PASSING the original assert (i.e., work_dir stays inside temp_dir or Err),
-        // the gap is fixed — delete this CANARY and re-enable the CONTRACT assert.
-        match &canon_made {
-            None => { /* Err would mean the gap is fixed — update this test */ }
-            Some(c) => assert!(
-                !c.starts_with(&base),
-                "CANARY: Session::new now refuses the traversal (work_dir={c:?} is inside temp_dir) — the gap is FIXED, update this test"
-            ),
-        }
+        let sess = Session::new(run_id).expect("a traversing run_id is sanitized, not rejected");
+        let canon = std::fs::canonicalize(sess.work_dir()).unwrap();
+        // CONTRACT: work_dir is a strict child of temp_dir — no escape.
+        assert!(
+            canon.starts_with(&base) && canon != base,
+            "run_id traversal escaped temp_dir: work_dir={canon:?} base={base:?}"
+        );
     }
 
-    /// `CANARY` — Distinct from creation: the remove_dir_all-before-create gives a DESTRUCTIVE primitive (delete any reachable dir), not just a benign mkdir.
-    /// FINDING: Session::new's remove_dir_all deletes a directory OUTSIDE temp_dir when run_id contains path traversal.
-    /// Pinning OBSERVED behavior: keepme.txt in the victim dir is deleted by Session::new's internal remove_dir_all.
-    /// seam: session.rs Session::new — `let _ = fs::remove_dir_all(&work_dir)` runs BEFORE create; destructive arbitrary-dir deletion
+    /// `CONTRACT` (was a CANARY for F-3) — Distinct from creation: the pre-create remove_dir_all must
+    /// target only the sanitized in-temp work_dir, so a victim dir OUTSIDE temp_dir is never deleted.
+    /// Unix-only (uses `/var/tmp` as a real out-of-temp location) with a PER-RUN-UNIQUE victim name,
+    /// so the test only ever creates/removes its OWN freshly-minted dir — never a pre-existing one.
+    /// seam: session.rs Session::new — `fs::remove_dir_all(&work_dir)` after run_id is flattened.
+    #[cfg(unix)]
     #[test]
-    fn known_gap_run_id_traversal_removes_dir_outside_temp_dir() {
-        // CRITICAL: plant the victim where the traversing run_id ACTUALLY resolves.
-        // On macOS the run_id below resolves to /var/tmp (canon /private/var/tmp), NOT /tmp (which is /private/tmp).
-        // The designer's original /tmp plant does NOT collide and would give a false PASS.
-        let victim = std::path::Path::new("/var/tmp").join("droplet-victim-delete-probe");
+    fn run_id_traversal_does_not_remove_dir_outside_temp_dir() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "droplet-victim-delete-probe-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let victim = std::path::Path::new("/var/tmp").join(&name);
         std::fs::create_dir_all(&victim).unwrap();
         std::fs::write(victim.join("keepme.txt"), b"do-not-delete").unwrap();
-        let run_id = "../../../../../../tmp/droplet-victim-delete-probe";
-        let _sess = Session::new(run_id); // remove_dir_all inside new() targets the resolved /var/tmp/... path
-        let still_there = victim.join("keepme.txt").exists();
-        let _ = std::fs::remove_dir_all(&victim); // cleanup
-        // FINDING: CANARY pinning OBSERVED behavior — Session::new deletes the victim dir outside temp_dir.
-        // still_there == false means the file was wiped: that is the OBSERVED gap.
+        // The un-sanitized run_id used to resolve out of temp_dir; sanitize keeps the wipe in-temp.
+        let run_id = format!("../../../../../../tmp/{name}");
+        let _sess = Session::new(&run_id).unwrap();
+        let survived = victim.join("keepme.txt").exists();
+        let _ = std::fs::remove_dir_all(&victim); // cleanup (only ever our own unique dir)
         assert!(
-            !still_there,
-            "CANARY: keepme.txt survived — Session::new no longer wipes outside temp_dir (gap may be FIXED, update this test)"
+            survived,
+            "Session::new wiped a dir OUTSIDE temp_dir via run_id traversal"
         );
     }
 
@@ -103,23 +92,28 @@ mod tests {
         );
     }
 
-    /// `CANARY` — Run_id collision: two concurrent sessions sharing a run_id silently corrupt each other's on-disk isolation — a lifecycle/isolation bug distinct from path traversal.
-    /// FINDING: identical run_id => identical work_dir => second Session::new's remove_dir_all wipes first live session's private state.
-    /// Pinning OBSERVED behavior: A's marker is deleted by B's constructor.
-    /// seam: session.rs Session::new — remove_dir_all on a colliding work_dir path; cross-session isolation of on-disk state
+    /// `CONTRACT` (was a CANARY for F-3) — Run_id collision: two sessions sharing a run_id must get
+    /// DISTINCT work dirs (per-instance unique suffix), so the second constructor's remove_dir_all
+    /// cannot wipe the first live session's on-disk state.
+    /// seam: session.rs Session::new — per-instance sequence in the work_dir name; cross-session isolation.
     #[test]
-    fn known_gap_same_run_id_second_session_wipes_first_sessions_work_dir() {
+    fn same_run_id_sessions_are_isolated() {
         let a = Session::new("collide-xyz").unwrap();
         let marker = a.work_dir().join("a_private.txt");
         std::fs::write(&marker, b"A-owns-this").unwrap();
         assert!(marker.exists());
-        let _b = Session::new("collide-xyz").unwrap();
+        let b = Session::new("collide-xyz").unwrap();
+        assert_ne!(
+            a.work_dir(),
+            b.work_dir(),
+            "two sessions with the same run_id must get DISTINCT work dirs"
+        );
         let a_state_survived = marker.exists();
         drop(a);
-        // FINDING: CANARY pinning OBSERVED behavior — B's constructor wipes A's marker (survived=false).
+        drop(b);
         assert!(
-            !a_state_survived,
-            "CANARY: A's marker survived — same-run_id collision no longer wipes the first session (gap may be FIXED, update this test)"
+            a_state_survived,
+            "second Session::new wiped the first live session's work_dir"
         );
     }
 
@@ -197,31 +191,32 @@ mod tests {
         assert!(!work_path.exists(), "close() must wipe the work_dir");
     }
 
-    /// `CANARY` — Separator injection (no ..): run_id with '/' nests work_dir, and Drop's remove of the deepest path leaves orphaned parent dirs — a contained but distinct residue/lifecycle defect.
-    /// FINDING: Drop removes only the deepest work_dir path, leaving empty parent dirs (droplet-sub, droplet-sub/deep) as orphaned residue.
-    /// Pinning OBSERVED behavior: leftover == true (parent dirs remain after Drop).
-    /// Note: the work_dir itself stays INSIDE temp_dir (no path-escape here — purely a teardown completeness gap).
-    /// seam: session.rs Session::new — run_id 'a/b/c' nests work_dir; Drop removes only the deepest path, leaving parent segments
+    /// `CONTRACT` (was a CANARY for F-3) — Separator injection (no ..): a run_id with '/' is flattened
+    /// to a single component, so the work_dir neither nests under temp_dir nor leaves orphaned parent
+    /// dirs after Drop.
+    /// seam: session.rs Session::new — run_id 'a/b/c' flattened to one segment; no nested mkdir, no residue.
     #[test]
-    fn known_gap_run_id_with_subdir_separators_leaves_parent_residue() {
+    fn run_id_with_subdir_separators_stays_contained_no_residue() {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        // Clean any pre-fix residue so the no-orphan assert below reflects only THIS run.
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("droplet-sub"));
         let run_id = "sub/deep/leaf";
         let work_canon = {
             let s = Session::new(run_id).expect("nested run_id constructs");
-            std::fs::canonicalize(s.work_dir()).unwrap()
-        }; // Drop here removes temp_dir/droplet-sub/deep/leaf only
-        let first_seg = std::env::temp_dir().join("droplet-sub");
-        let leftover = first_seg.exists();
-        let _ = std::fs::remove_dir_all(&first_seg);
-        // The work_dir stays inside temp_dir (good — no escape).
+            let c = std::fs::canonicalize(s.work_dir()).unwrap();
+            // CONTRACT: a single child of temp_dir — its parent IS temp_dir (no intermediate dirs).
+            assert_eq!(
+                c.parent().map(std::path::Path::to_path_buf),
+                Some(base.clone()),
+                "run_id separators created nested dirs under temp_dir: {c:?}"
+            );
+            c
+        }; // Drop runs here
+        assert!(!work_canon.exists(), "Drop must fully wipe the work_dir");
+        // The pre-fix orphan path must not exist.
         assert!(
-            work_canon.starts_with(&base),
-            "nested run_id must stay under temp_dir, got {work_canon:?}"
-        );
-        // FINDING: CANARY pinning OBSERVED behavior — parent dirs are NOT removed by Drop (leftover==true).
-        assert!(
-            leftover,
-            "CANARY: no leftover parent dirs found — Drop now fully cleans the nested tree (gap may be FIXED, update this test)"
+            !std::env::temp_dir().join("droplet-sub").exists(),
+            "orphaned parent dir 'droplet-sub' left behind"
         );
     }
 
